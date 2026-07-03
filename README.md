@@ -1,7 +1,6 @@
 # micaudio-training
 
 ```bash
-cd ~/micaudio/training
 uv sync
 uv run python -m train inspect Dataset
 ```

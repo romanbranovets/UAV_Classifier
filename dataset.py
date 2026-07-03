@@ -12,8 +12,9 @@ from typing import Iterator, Optional, Sequence
 import numpy as np
 import soundfile as sf
 import torch
-from torch.utils.data import Dataset, Subset
+from torch.utils.data import Dataset, Subset, WeightedRandomSampler
 
+from augment import AugmentConfig, apply_spec_augment, mix_at_snr
 from config import PreprocessConfig
 from preprocess import ListenChannelPreprocessor
 
@@ -262,14 +263,20 @@ class ListenChannelDataset(Dataset):
         session_dirs: Optional[Sequence[Path | str]] = None,
         *,
         cache_clips: bool = True,
+        augment_config: Optional[AugmentConfig] = None,
+        seed: int = 0,
     ) -> None:
         self.root = Path(root)
         self.config = config or PreprocessConfig()
         self.preprocessor = ListenChannelPreprocessor(self.config)
         self.cache_clips = cache_clips
+        self.augment_config = augment_config or AugmentConfig()
+        self._rng = np.random.default_rng(seed)
 
         self.clips: list[ChannelClip] = []
         self.windows: list[ClipWindowRef] = []
+        self._background_indices: list[int] = []
+        self._augment_indices: set[int] = set()
         self._audio_cache: dict[tuple[str, str], tuple[np.ndarray, int]] = {}
 
         only = [Path(p) for p in session_dirs] if session_dirs is not None else None
@@ -284,7 +291,23 @@ class ListenChannelDataset(Dataset):
                 clip_index = len(self.clips)
                 self.clips.append(clip)
                 for start in iter_window_starts(clip.num_samples, win, stride):
+                    window_index = len(self.windows)
                     self.windows.append(ClipWindowRef(clip_index=clip_index, start_sample=start))
+                    if clip.label == Label.BKG:
+                        self._background_indices.append(window_index)
+
+        self._clip_labels = np.fromiter(
+            (int(c.label) for c in self.clips), dtype=np.int8, count=len(self.clips)
+        )
+        self._window_clip_index = np.fromiter(
+            (w.clip_index for w in self.windows), dtype=np.int32, count=len(self.windows)
+        )
+    def set_augment_indices(self, indices: Sequence[int]) -> None:
+        """Enable augmentations only for these dataset indices (e.g. train split)."""
+        self._augment_indices = set(indices)
+
+    def clear_augment_indices(self) -> None:
+        self._augment_indices.clear()
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -313,29 +336,59 @@ class ListenChannelDataset(Dataset):
             self._audio_cache[key] = (audio, sample_rate)
         return audio, sample_rate
 
-    def __getitem__(self, index: int) -> dict[str, object]:
+    def _load_window_chunk(self, index: int) -> tuple[np.ndarray, int, int]:
         window = self.windows[index]
         clip = self.clips[window.clip_index]
         audio, sample_rate = self._load_clip_audio(clip)
-
         win = self.config.window_samples_source
-        start = window.start_sample
-        chunk = audio[start : start + win]
+        chunk = audio[window.start_sample : window.start_sample + win]
+        return chunk, sample_rate, int(clip.label)
+
+    def __getitem__(self, index: int) -> dict[str, object]:
+        window = self.windows[index]
+        clip = self.clips[window.clip_index]
+        chunk, sample_rate, _ = self._load_window_chunk(index)
+        label = int(clip.label)
+
+        if index in self._augment_indices and self._background_indices:
+            cfg = self.augment_config
+            if label in (Label.DVS, Label.ED) and self._rng.random() < cfg.noise_mix_p:
+                bg_index = int(self._rng.choice(self._background_indices))
+                bg_chunk, _, _ = self._load_window_chunk(bg_index)
+                snr_db = self._rng.uniform(cfg.snr_min_db, cfg.snr_max_db)
+                chunk = mix_at_snr(chunk, bg_chunk, snr_db)
 
         log_mel = self.preprocessor.process_window(chunk, sample_rate)
 
+        if index in self._augment_indices:
+            log_mel = apply_spec_augment(log_mel, label, self.augment_config, self._rng)
+
         return {
             "log_mel": torch.from_numpy(log_mel),
-            "label": torch.tensor(int(clip.label), dtype=torch.long),
+            "label": torch.tensor(label, dtype=torch.long),
             "tabular": clip.tabular.as_tensor(),
             "session_id": clip.session.session_id,
             "session_date": clip.session.date,
             "session_num": clip.session.num,
             "split_key": clip.session.split_key,
             "channel": clip.channel_key,
-            "start_sample": start,
-            "label_name": CLASS_NAMES[int(clip.label)],
+            "start_sample": window.start_sample,
+            "label_name": CLASS_NAMES[label],
         }
+
+
+def weighted_sampler(
+    dataset: ListenChannelDataset,
+    indices: Sequence[int],
+    *,
+    ed_weight: Optional[float] = None,
+) -> WeightedRandomSampler:
+    """Oversample ЭД windows (tier-1 class balance)."""
+    boost = dataset.augment_config.ed_sample_weight if ed_weight is None else ed_weight
+    idx = np.asarray(indices, dtype=np.intp)
+    labels = dataset._clip_labels[dataset._window_clip_index[idx]]
+    weights = np.where(labels == Label.ED, boost, 1.0)
+    return WeightedRandomSampler(weights, num_samples=idx.size, replacement=True)
 
 
 def split_dataset_by_session(
@@ -360,3 +413,15 @@ def split_dataset_by_session(
             train_indices.append(index)
 
     return Subset(dataset, train_indices), Subset(dataset, val_indices)
+
+
+def prepare_train_split(
+    dataset: ListenChannelDataset,
+    val_ratio: float = 0.15,
+    seed: int = 42,
+) -> tuple[Subset, Subset, WeightedRandomSampler]:
+    """Session split + train augmentations + ЭД oversampling sampler."""
+    train_ds, val_ds = split_dataset_by_session(dataset, val_ratio=val_ratio, seed=seed)
+    dataset.set_augment_indices(train_ds.indices)
+    sampler = weighted_sampler(dataset, train_ds.indices)
+    return train_ds, val_ds, sampler

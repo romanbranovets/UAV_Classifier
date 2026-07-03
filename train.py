@@ -5,7 +5,7 @@ from __future__ import annotations
 import argparse
 from pathlib import Path
 
-from dataset import ListenChannelDataset, split_dataset_by_session
+from dataset import ListenChannelDataset, prepare_train_split
 
 
 def _cmd_inspect(args: argparse.Namespace) -> None:
@@ -25,8 +25,10 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
     print(f"window labels: {dict(sorted(window_labels.items()))}")
 
     if args.val_ratio > 0:
-        train_ds, val_ds = split_dataset_by_session(dataset, val_ratio=args.val_ratio)
+        train_ds, val_ds, _sampler = prepare_train_split(dataset, val_ratio=args.val_ratio)
         print(f"train windows: {len(train_ds)}  val windows: {len(val_ds)}")
+        print(f"augment: on for {len(train_ds.indices)} train windows")
+        print(f"background pool: {len(dataset._background_indices)} windows")
 
     if len(dataset) > 0:
         sample = dataset[0]
