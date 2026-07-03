@@ -1,0 +1,14 @@
+[project]
+name = "micaudio-training"
+version = "0.1.0"
+description = "x502 listen-channel classifier training"
+requires-python = ">=3.10"
+dependencies = [
+    "numpy>=1.24",
+    "soundfile>=0.12",
+    "librosa>=0.10",
+    "torch>=2.0",
+]
+
+[tool.uv]
+package = false
