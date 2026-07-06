@@ -66,6 +66,11 @@ def _batch_progress(iterable, *, desc: str):
     )
 
 
+def _update_batch_postfix(pbar, *, loss: float) -> None:
+    if hasattr(pbar, "set_postfix"):
+        pbar.set_postfix(loss=f"{loss:.4f}")
+
+
 def _epoch_progress(iterable, *, desc: str, unit: str = "epoch"):
     if not _show_epoch_progress():
         return iterable
@@ -209,7 +214,7 @@ def _eval_epoch(
         labels_all.extend(labels.cpu().tolist())
         preds_all.extend(preds.cpu().tolist())
         total += labels.numel()
-        pbar.set_postfix(loss=f"{total_loss / total:.4f}")
+        _update_batch_postfix(pbar, loss=total_loss / total)
     y_true = np.asarray(labels_all, dtype=np.int64)
     y_pred = np.asarray(preds_all, dtype=np.int64)
     metrics = _compute_metrics(y_true, y_pred)
@@ -243,7 +248,7 @@ def _train_epoch(
 
         total_loss += float(loss.item()) * labels.size(0)
         total += labels.size(0)
-        pbar.set_postfix(loss=f"{total_loss / total:.4f}")
+        _update_batch_postfix(pbar, loss=total_loss / total)
     return total_loss / max(total, 1)
 
 
