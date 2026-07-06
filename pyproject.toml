@@ -5,9 +5,11 @@ description = "x502 listen-channel classifier training"
 requires-python = ">=3.10"
 dependencies = [
     "numpy>=1.24",
+    "scikit-learn>=1.3",
     "soundfile>=0.12",
-    "librosa>=0.10",
     "torch>=2.0",
+    "torchaudio>=2.0",
+    "tqdm>=4.66",
 ]
 
 [tool.uv]

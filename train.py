@@ -3,9 +3,295 @@
 from __future__ import annotations
 
 import argparse
+import copy
 from pathlib import Path
 
-from dataset import ListenChannelDataset, prepare_train_split
+import numpy as np
+import torch
+import torch.nn as nn
+from sklearn.metrics import accuracy_score, precision_recall_fscore_support
+from torch.utils.data import DataLoader
+from tqdm import tqdm
+
+from config import BEATS_CHECKPOINT, DEVICE, NUM_CLASSES, DataLoaderConfig, TrainConfig
+from dataloader import make_dataloaders
+from dataset import CLASS_NAMES, ListenChannelDataset, prepare_train_split
+from model import ListenChannelBeatsClassifier
+
+
+class EarlyStopping:
+    """Stop when ``val_loss`` does not improve for ``patience`` epochs; restore best weights."""
+
+    def __init__(self, *, patience: int, min_delta: float = 0.0) -> None:
+        self.patience = patience
+        self.min_delta = min_delta
+        self.best_loss = float("inf")
+        self.best_state: dict[str, torch.Tensor] | None = None
+        self.epochs_without_improvement = 0
+
+    def step(self, model: nn.Module, val_loss: float) -> bool:
+        if val_loss < self.best_loss - self.min_delta:
+            self.best_loss = val_loss
+            self.best_state = copy.deepcopy(model.state_dict())
+            self.epochs_without_improvement = 0
+            return False
+
+        self.epochs_without_improvement += 1
+        return self.epochs_without_improvement >= self.patience
+
+    def restore_best(self, model: nn.Module) -> None:
+        if self.best_state is not None:
+            model.load_state_dict(self.best_state)
+
+
+class BestCheckpointSaver:
+    """Persist best weights to disk whenever validation loss improves."""
+
+    def __init__(self, path: Path, *, min_delta: float = 0.0) -> None:
+        self.path = path
+        self.min_delta = min_delta
+        self.best_loss = float("inf")
+
+    def maybe_save(
+        self,
+        model: nn.Module,
+        val_loss: float,
+        *,
+        phase: str,
+        epoch: int,
+        metrics: str,
+    ) -> bool:
+        if val_loss >= self.best_loss - self.min_delta:
+            return False
+
+        self.best_loss = val_loss
+        self.path.parent.mkdir(parents=True, exist_ok=True)
+        torch.save(
+            {
+                "model": model.state_dict(),
+                "class_names": CLASS_NAMES,
+                "val_loss": val_loss,
+                "phase": phase,
+                "epoch": epoch,
+                "metrics": metrics,
+            },
+            self.path,
+        )
+        print(f"  saved best  val_loss={val_loss:.4f}  -> {self.path}")
+        return True
+
+def _format_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> str:
+    labels = list(range(NUM_CLASSES))
+    acc = accuracy_score(y_true, y_pred)
+    macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=labels, average="macro", zero_division=0
+    )
+    prec, rec, f1, _ = precision_recall_fscore_support(
+        y_true, y_pred, labels=labels, average=None, zero_division=0
+    )
+    per_class = " ".join(
+        f"{name}:P={prec[i]:.2f}/R={rec[i]:.2f}/F1={f1[i]:.2f}"
+        for i, name in enumerate(CLASS_NAMES)
+    )
+    return f"acc={acc:.3f}  P={macro_p:.3f}  R={macro_r:.3f}  F1={macro_f1:.3f}  ({per_class})"
+
+
+def _format_lrs(optimizer: torch.optim.Optimizer) -> str:
+    return "/".join(f"{group['lr']:.2e}" for group in optimizer.param_groups)
+
+
+def _make_lr_scheduler(
+    optimizer: torch.optim.Optimizer,
+    config: TrainConfig,
+) -> torch.optim.lr_scheduler.ReduceLROnPlateau:
+    return torch.optim.lr_scheduler.ReduceLROnPlateau(
+        optimizer,
+        mode="min",
+        factor=config.lr_scheduler_factor,
+        patience=config.lr_scheduler_patience,
+        min_lr=config.lr_scheduler_min_lr,
+    )
+
+
+@torch.no_grad()
+def _eval_epoch(
+    model: ListenChannelBeatsClassifier,
+    loader: DataLoader,
+    criterion: nn.Module,
+    *,
+    desc: str = "val",
+) -> tuple[float, str]:
+    model.eval()
+    total_loss = 0.0
+    total = 0
+    labels_all: list[int] = []
+    preds_all: list[int] = []
+    pbar = tqdm(loader, desc=desc, leave=False)
+    for batch in pbar:
+        fbank = batch["fbank"].to(DEVICE)
+        labels = batch["label"].to(DEVICE)
+        logits = model(fbank)["logits"]
+        total_loss += float(criterion(logits, labels).item()) * labels.size(0)
+        preds = logits.argmax(dim=1)
+        labels_all.extend(labels.cpu().tolist())
+        preds_all.extend(preds.cpu().tolist())
+        total += labels.numel()
+        pbar.set_postfix(loss=f"{total_loss / total:.4f}")
+    y_true = np.asarray(labels_all, dtype=np.int64)
+    y_pred = np.asarray(preds_all, dtype=np.int64)
+    return total_loss / max(total, 1), _format_classification_metrics(y_true, y_pred)
+
+
+def _train_epoch(
+    model: ListenChannelBeatsClassifier,
+    loader: DataLoader,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    *,
+    desc: str = "train",
+) -> float:
+    model.train()
+    if not any(p.requires_grad for p in model.encoder.parameters()):
+        model.encoder.eval()
+
+    total_loss = 0.0
+    total = 0
+    pbar = tqdm(loader, desc=desc, leave=False)
+    for batch in pbar:
+        fbank = batch["fbank"].to(DEVICE)
+        labels = batch["label"].to(DEVICE)
+
+        optimizer.zero_grad(set_to_none=True)
+        logits = model(fbank)["logits"]
+        loss = criterion(logits, labels)
+        loss.backward()
+        optimizer.step()
+
+        total_loss += float(loss.item()) * labels.size(0)
+        total += labels.size(0)
+        pbar.set_postfix(loss=f"{total_loss / total:.4f}")
+    return total_loss / max(total, 1)
+
+
+def _run_phase(
+    model: ListenChannelBeatsClassifier,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    *,
+    criterion: nn.Module,
+    optimizer: torch.optim.Optimizer,
+    scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau,
+    phase_name: str,
+    max_epochs: int,
+    early_stopping: EarlyStopping,
+    checkpoint_saver: BestCheckpointSaver | None = None,
+) -> None:
+    for epoch in tqdm(range(1, max_epochs + 1), desc=phase_name, unit="epoch"):
+        train_loss = _train_epoch(
+            model,
+            train_loader,
+            criterion,
+            optimizer,
+            desc=f"{phase_name} e{epoch:02d} train",
+        )
+        val_loss, val_metrics = _eval_epoch(
+            model,
+            val_loader,
+            criterion,
+            desc=f"{phase_name} e{epoch:02d} val",
+        )
+        scheduler.step(val_loss)
+        if checkpoint_saver is not None:
+            checkpoint_saver.maybe_save(
+                model,
+                val_loss,
+                phase=phase_name,
+                epoch=epoch,
+                metrics=val_metrics,
+            )
+        stop = early_stopping.step(model, val_loss)
+        print(
+            f"  {phase_name} epoch {epoch:02d}  "
+            f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
+            f"lr={_format_lrs(optimizer)}  {val_metrics}"
+            + ("  [stop]" if stop else "")
+        )
+        if stop:
+            break
+
+    early_stopping.restore_best(model)
+    best_loss, best_metrics = _eval_epoch(
+        model,
+        val_loader,
+        criterion,
+        desc=f"{phase_name} best val",
+    )
+    print(f"  {phase_name} best  val_loss={best_loss:.4f}  {best_metrics}")
+
+
+def train_model(
+    model: ListenChannelBeatsClassifier,
+    train_loader: DataLoader,
+    val_loader: DataLoader,
+    *,
+    config: TrainConfig,
+    output: Path | None = None,
+) -> ListenChannelBeatsClassifier:
+    model = model.to(DEVICE)
+    criterion = nn.CrossEntropyLoss()
+    checkpoint_saver = (
+        BestCheckpointSaver(output, min_delta=config.min_delta) if output is not None else None
+    )
+
+    print(
+        f"phase 1: head only, lr={config.head_lr}, "
+        f"max_epochs={config.head_max_epochs}, patience={config.patience}"
+    )
+    head_stop = EarlyStopping(patience=config.patience, min_delta=config.min_delta)
+    optimizer = torch.optim.AdamW(
+        [model.head_parameter_group(lr=config.head_lr)],
+        weight_decay=config.weight_decay,
+    )
+    head_scheduler = _make_lr_scheduler(optimizer, config)
+    _run_phase(
+        model,
+        train_loader,
+        val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=head_scheduler,
+        phase_name="head",
+        max_epochs=config.head_max_epochs,
+        early_stopping=head_stop,
+        checkpoint_saver=checkpoint_saver,
+    )
+
+    print(
+        f"phase 2: unfreeze last {config.unfreeze_last_n_layers} encoder layers, "
+        f"head_lr={config.head_lr}, encoder_lr={config.encoder_lr}, "
+        f"max_epochs={config.encoder_max_epochs}, patience={config.patience}"
+    )
+    model.begin_encoder_finetune(last_n_layers=config.unfreeze_last_n_layers)
+    encoder_stop = EarlyStopping(patience=config.patience, min_delta=config.min_delta)
+    optimizer = torch.optim.AdamW(
+        model.parameter_groups(encoder_lr=config.encoder_lr, head_lr=config.head_lr),
+        weight_decay=config.weight_decay,
+    )
+    encoder_scheduler = _make_lr_scheduler(optimizer, config)
+    _run_phase(
+        model,
+        train_loader,
+        val_loader,
+        criterion=criterion,
+        optimizer=optimizer,
+        scheduler=encoder_scheduler,
+        phase_name="enc",
+        max_epochs=config.encoder_max_epochs,
+        early_stopping=encoder_stop,
+        checkpoint_saver=checkpoint_saver,
+    )
+
+    return model
 
 
 def _cmd_inspect(args: argparse.Namespace) -> None:
@@ -28,19 +314,45 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
         train_ds, val_ds, _sampler = prepare_train_split(dataset, val_ratio=args.val_ratio)
         print(f"train windows: {len(train_ds)}  val windows: {len(val_ds)}")
         print(f"augment: on for {len(train_ds.indices)} train windows")
-        print(f"background pool: {len(dataset._background_indices)} windows")
+        print(f"background pool: {len(dataset._train_background_indices)} train windows")
 
     if len(dataset) > 0:
         sample = dataset[0]
+        clip = dataset.clips[dataset.windows[0].clip_index]
         print(
-            f"sample: log_mel={tuple(sample['log_mel'].shape)} "
-            f"label={sample['label_name']} session={sample['session_id']} "
-            f"channel={sample['channel']} tabular={sample['tabular'].tolist()}"
+            f"sample: fbank={tuple(sample['fbank'].shape)} "
+            f"label={CLASS_NAMES[int(sample['label'])]} "
+            f"session={clip.session.session_id} channel={clip.channel_key}"
         )
 
 
-def _cmd_train(_args: argparse.Namespace) -> None:
-    raise NotImplementedError("training step not implemented yet")
+def _cmd_train(args: argparse.Namespace) -> None:
+    checkpoint = args.checkpoint
+    if not checkpoint.is_file():
+        raise FileNotFoundError(f"BEATs checkpoint not found: {checkpoint}")
+
+    train_cfg = TrainConfig(
+        head_max_epochs=args.head_max_epochs,
+        encoder_max_epochs=args.encoder_max_epochs,
+        patience=args.patience,
+        min_delta=args.min_delta,
+        head_lr=args.head_lr,
+        encoder_lr=args.encoder_lr,
+        unfreeze_last_n_layers=args.unfreeze_layers,
+        val_ratio=args.val_ratio,
+        seed=args.seed,
+    )
+    loader_cfg = DataLoaderConfig(batch_size=args.batch_size, num_workers=args.num_workers)
+
+    train_loader, val_loader, _, _, _ = make_dataloaders(
+        args.dataset,
+        loader_config=loader_cfg,
+        val_ratio=train_cfg.val_ratio,
+        seed=train_cfg.seed,
+    )
+
+    model = ListenChannelBeatsClassifier.from_checkpoint(checkpoint)
+    train_model(model, train_loader, val_loader, config=train_cfg, output=args.output)
 
 
 def main() -> None:
@@ -52,7 +364,21 @@ def main() -> None:
     p_inspect.add_argument("--val-ratio", type=float, default=0.15)
     p_inspect.set_defaults(func=_cmd_inspect)
 
-    p_train = sub.add_parser("train", help="train classifier (not implemented)")
+    p_train = sub.add_parser("train", help="two-phase BEATs fine-tune (head → encoder)")
+    p_train.add_argument("dataset", type=Path)
+    p_train.add_argument("--checkpoint", type=Path, default=Path(BEATS_CHECKPOINT))
+    p_train.add_argument("--output", type=Path, default=Path("checkpoints/listen_classifier.pt"))
+    p_train.add_argument("--batch-size", type=int, default=32)
+    p_train.add_argument("--num-workers", type=int, default=2)
+    p_train.add_argument("--head-max-epochs", type=int, default=50)
+    p_train.add_argument("--encoder-max-epochs", type=int, default=50)
+    p_train.add_argument("--patience", type=int, default=5)
+    p_train.add_argument("--min-delta", type=float, default=1e-4)
+    p_train.add_argument("--head-lr", type=float, default=1e-3)
+    p_train.add_argument("--encoder-lr", type=float, default=1e-5)
+    p_train.add_argument("--unfreeze-layers", type=int, default=2)
+    p_train.add_argument("--val-ratio", type=float, default=0.15)
+    p_train.add_argument("--seed", type=int, default=0)
     p_train.set_defaults(func=_cmd_train)
 
     args = parser.parse_args()

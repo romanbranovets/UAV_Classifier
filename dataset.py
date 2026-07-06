@@ -14,8 +14,8 @@ import soundfile as sf
 import torch
 from torch.utils.data import Dataset, Subset, WeightedRandomSampler
 
-from augment import AugmentConfig, apply_spec_augment, mix_at_snr
-from config import PreprocessConfig
+from augment import apply_spec_augment, mix_at_snr
+from config import AugmentConfig, PreprocessConfig
 from preprocess import ListenChannelPreprocessor
 
 SESSION_DIR_RE = re.compile(
@@ -251,7 +251,7 @@ def iter_labeled_clips(session: SessionInfo) -> Iterator[ChannelClip]:
 
 class ListenChannelDataset(Dataset):
     """
-    One labeled channel per clip (``Тип цели``), concatenated segments, 1 s windows.
+    One labeled channel per clip (``Тип цели``), concatenated segments, fixed-length windows.
 
     Session folders: ``DD_MM_YYYY_HH-MM-SS-mmm_N`` (``N`` restarts at 1 for each date).
     """
@@ -276,6 +276,7 @@ class ListenChannelDataset(Dataset):
         self.clips: list[ChannelClip] = []
         self.windows: list[ClipWindowRef] = []
         self._background_indices: list[int] = []
+        self._train_background_indices: list[int] = []
         self._augment_indices: set[int] = set()
         self._audio_cache: dict[tuple[str, str], tuple[np.ndarray, int]] = {}
 
@@ -302,12 +303,16 @@ class ListenChannelDataset(Dataset):
         self._window_clip_index = np.fromiter(
             (w.clip_index for w in self.windows), dtype=np.int32, count=len(self.windows)
         )
+
     def set_augment_indices(self, indices: Sequence[int]) -> None:
         """Enable augmentations only for these dataset indices (e.g. train split)."""
-        self._augment_indices = set(indices)
+        train = set(indices)
+        self._augment_indices = train
+        self._train_background_indices = [i for i in self._background_indices if i in train]
 
     def clear_augment_indices(self) -> None:
         self._augment_indices.clear()
+        self._train_background_indices.clear()
 
     def __len__(self) -> int:
         return len(self.windows)
@@ -344,36 +349,28 @@ class ListenChannelDataset(Dataset):
         chunk = audio[window.start_sample : window.start_sample + win]
         return chunk, sample_rate, int(clip.label)
 
-    def __getitem__(self, index: int) -> dict[str, object]:
+    def __getitem__(self, index: int) -> dict[str, torch.Tensor]:
         window = self.windows[index]
         clip = self.clips[window.clip_index]
         chunk, sample_rate, _ = self._load_window_chunk(index)
         label = int(clip.label)
 
-        if index in self._augment_indices and self._background_indices:
+        if index in self._augment_indices and self._train_background_indices:
             cfg = self.augment_config
             if label in (Label.DVS, Label.ED) and self._rng.random() < cfg.noise_mix_p:
-                bg_index = int(self._rng.choice(self._background_indices))
+                bg_index = int(self._rng.choice(self._train_background_indices))
                 bg_chunk, _, _ = self._load_window_chunk(bg_index)
                 snr_db = self._rng.uniform(cfg.snr_min_db, cfg.snr_max_db)
                 chunk = mix_at_snr(chunk, bg_chunk, snr_db)
 
-        log_mel = self.preprocessor.process_window(chunk, sample_rate)
+        fbank = self.preprocessor.process_window(chunk, sample_rate)
 
         if index in self._augment_indices:
-            log_mel = apply_spec_augment(log_mel, label, self.augment_config, self._rng)
+            fbank = apply_spec_augment(fbank, label, self.augment_config, self._rng)
 
         return {
-            "log_mel": torch.from_numpy(log_mel),
+            "fbank": torch.from_numpy(fbank).unsqueeze(0),
             "label": torch.tensor(label, dtype=torch.long),
-            "tabular": clip.tabular.as_tensor(),
-            "session_id": clip.session.session_id,
-            "session_date": clip.session.date,
-            "session_num": clip.session.num,
-            "split_key": clip.session.split_key,
-            "channel": clip.channel_key,
-            "start_sample": window.start_sample,
-            "label_name": CLASS_NAMES[label],
         }
 
 
@@ -391,18 +388,72 @@ def weighted_sampler(
     return WeightedRandomSampler(weights, num_samples=idx.size, replacement=True)
 
 
+_REQUIRED_VAL_LABELS = frozenset(Label)
+
+
+def _session_label_sets(dataset: ListenChannelDataset) -> dict[str, frozenset[Label]]:
+    labels: dict[str, set[Label]] = {}
+    for clip in dataset.clips:
+        labels.setdefault(clip.session.split_key, set()).add(clip.label)
+    return {key: frozenset(value) for key, value in labels.items()}
+
+
+def _select_val_session_keys(
+    keys: Sequence[str],
+    session_labels: dict[str, frozenset[Label]],
+    n_val: int,
+    rng: np.random.Generator,
+) -> list[str]:
+    """
+    Pick val sessions without leakage: cover Фон/ДВС/ЭД, then fill to ``n_val``.
+
+    Class coverage has priority over ``val_ratio`` when a single session cannot
+    represent all labels.
+    """
+    val_keys: list[str] = []
+    val_set: set[str] = set()
+    uncovered = set(_REQUIRED_VAL_LABELS)
+
+    while uncovered:
+        candidates = [
+            (key, len(session_labels[key] & uncovered))
+            for key in keys
+            if key not in val_set and session_labels[key] & uncovered
+        ]
+        if not candidates:
+            missing = sorted(CLASS_NAMES[int(label)] for label in uncovered)
+            raise ValueError(f"val split cannot cover labels: {missing}")
+
+        max_score = max(score for _, score in candidates)
+        best = [key for key, score in candidates if score == max_score]
+        pick = best[int(rng.integers(len(best)))]
+        val_keys.append(pick)
+        val_set.add(pick)
+        uncovered -= session_labels[pick]
+
+    for key in keys:
+        if len(val_keys) >= n_val:
+            break
+        if key not in val_set:
+            val_keys.append(key)
+            val_set.add(key)
+
+    return val_keys
+
+
 def split_dataset_by_session(
     dataset: ListenChannelDataset,
     val_ratio: float = 0.15,
     seed: int = 42,
 ) -> tuple[Subset, Subset]:
-    """Train/val split by session folder — no leakage (``date_num``, N per date)."""
+    """Train/val split by session folder — no leakage, val covers all labels."""
     keys = list(dict.fromkeys(clip.session.split_key for clip in dataset.clips))
+    session_labels = _session_label_sets(dataset)
     rng = np.random.default_rng(seed)
     rng.shuffle(keys)
 
     n_val = max(1, int(round(len(keys) * val_ratio)))
-    val_keys = set(keys[:n_val])
+    val_keys = set(_select_val_session_keys(keys, session_labels, n_val, rng))
 
     train_indices: list[int] = []
     val_indices: list[int] = []

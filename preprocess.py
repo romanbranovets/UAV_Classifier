@@ -1,11 +1,12 @@
-"""PCM window -> log-mel preprocessing (used by ListenChannelDataset)."""
+"""PCM window -> Kaldi fbank preprocessing (used by ListenChannelDataset)."""
 
 from __future__ import annotations
 
 from typing import Optional
 
-import librosa
 import numpy as np
+import torch
+import torchaudio.compliance.kaldi as ta_kaldi
 
 from config import PreprocessConfig
 
@@ -30,10 +31,10 @@ def simple_resample_mono(pcm: np.ndarray, input_rate: int, target_rate: int) -> 
 def mono_to_model_input(
     samples: np.ndarray,
     source_rate: int,
-    input_sec: float,
+    required_samples: int,
     target_rate: int,
 ) -> np.ndarray:
-    required = int(round(input_sec * target_rate))
+    required = required_samples
     wave = np.zeros(required, dtype=np.float32)
     if samples.size == 0:
         return wave
@@ -44,60 +45,27 @@ def mono_to_model_input(
     return wave
 
 
-def peak_normalize(wave: np.ndarray) -> np.ndarray:
-    if wave.size == 0:
-        return np.zeros(0, dtype=np.float32)
-    max_abs = float(np.max(np.abs(wave)))
-    if max_abs == 0.0:
-        return np.zeros_like(wave, dtype=np.float32)
-    return (wave / max_abs).astype(np.float32)
-
-
 class ListenChannelPreprocessor:
-    """1 s PCM @ source_rate -> log-mel [n_mels, time_bins]."""
+    """1 s PCM @ source_rate -> Kaldi fbank [num_mel_bins, num_frames] for BEATs."""
 
     def __init__(self, config: Optional[PreprocessConfig] = None):
         self.config = config or PreprocessConfig()
+
+    def compute_fbank(self, waveform: np.ndarray) -> np.ndarray:
         cfg = self.config
-        self._win_length = cfg.n_fft
-        self._hop_length = cfg.hop_length
-        self._n_frames = cfg.time_bins
-        self._n_freq = self._win_length // 2 + 1
-        self._hann = np.hanning(self._win_length).astype(np.float32)
-        self._mel_basis = librosa.filters.mel(
-            sr=cfg.sample_rate,
-            n_fft=cfg.n_fft,
-            n_mels=cfg.n_mels,
-            fmin=cfg.fmin_hz,
-            fmax=cfg.fmax_hz,
-            norm="slaney",
-            htk=False,
-        ).astype(np.float32)
-
-    def compute_log_mel(self, waveform: np.ndarray) -> np.ndarray:
-        wave = waveform.astype(np.float32, copy=False)
-        n = wave.shape[0]
-        power = np.zeros((self._n_frames, self._n_freq), dtype=np.float32)
-
-        for t in range(self._n_frames):
-            offset = t * self._hop_length
-            frame = np.zeros(self._win_length, dtype=np.float32)
-            for i in range(self._win_length):
-                idx = offset + i
-                if idx < n:
-                    frame[i] = wave[idx]
-            frame *= self._hann
-            spectrum = np.fft.rfft(frame, n=self._win_length)
-            power[t, :] = (spectrum.real * spectrum.real + spectrum.imag * spectrum.imag).astype(
-                np.float32
-            )
-
-        mel = power @ self._mel_basis.T
-        return np.log1p(np.maximum(mel, 0.0), dtype=np.float32).T
+        wave = torch.from_numpy(waveform.astype(np.float32, copy=False)).unsqueeze(0)
+        wave = wave * (2**15)
+        fbank = ta_kaldi.fbank(
+            wave,
+            num_mel_bins=cfg.num_mel_bins,
+            sample_frequency=cfg.sample_rate,
+            frame_length=cfg.frame_length_ms,
+            frame_shift=cfg.frame_shift_ms,
+        )
+        fbank = (fbank - cfg.fbank_mean) / (2.0 * cfg.fbank_std)
+        return fbank.numpy().T.astype(np.float32, copy=False)
 
     def process_window(self, pcm: np.ndarray, source_rate: int) -> np.ndarray:
         cfg = self.config
-        wave = peak_normalize(
-            mono_to_model_input(pcm, source_rate, cfg.input_sec, cfg.sample_rate)
-        )
-        return self.compute_log_mel(wave)
+        wave = mono_to_model_input(pcm, source_rate, cfg.model_samples, cfg.sample_rate)
+        return self.compute_fbank(wave)
