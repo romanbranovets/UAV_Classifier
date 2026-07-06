@@ -23,7 +23,7 @@ def make_dataloaders(
     cache_clips: bool = True,
 ) -> tuple[DataLoader, DataLoader, ListenChannelDataset, Subset, Subset]:
     """
-    Build train/val DataLoaders with session split, augmentations, and ЭД oversampling.
+    Build train/val DataLoaders with session split, augmentations, and class balancing.
 
     Train loader uses ``WeightedRandomSampler`` (no shuffle). Val loader is sequential.
     """

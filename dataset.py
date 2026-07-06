@@ -377,14 +377,14 @@ class ListenChannelDataset(Dataset):
 def weighted_sampler(
     dataset: ListenChannelDataset,
     indices: Sequence[int],
-    *,
-    ed_weight: Optional[float] = None,
 ) -> WeightedRandomSampler:
-    """Oversample ЭД windows (tier-1 class balance)."""
-    boost = dataset.augment_config.ed_sample_weight if ed_weight is None else ed_weight
+    """Inverse-frequency weights — equal expected class share in train batches."""
     idx = np.asarray(indices, dtype=np.intp)
-    labels = dataset._clip_labels[dataset._window_clip_index[idx]]
-    weights = np.where(labels == Label.ED, boost, 1.0)
+    labels = dataset._clip_labels[dataset._window_clip_index[idx]].astype(np.intp)
+    counts = np.bincount(labels, minlength=len(CLASS_NAMES)).astype(np.float64)
+    counts = np.maximum(counts, 1.0)
+    class_weights = counts[0] / counts
+    weights = class_weights[labels]
     return WeightedRandomSampler(weights, num_samples=idx.size, replacement=True)
 
 
@@ -471,7 +471,7 @@ def prepare_train_split(
     val_ratio: float = 0.15,
     seed: int = 42,
 ) -> tuple[Subset, Subset, WeightedRandomSampler]:
-    """Session split + train augmentations + ЭД oversampling sampler."""
+    """Session split + train augmentations + class-balanced sampler."""
     train_ds, val_ds = split_dataset_by_session(dataset, val_ratio=val_ratio, seed=seed)
     dataset.set_augment_indices(train_ds.indices)
     sampler = weighted_sampler(dataset, train_ds.indices)

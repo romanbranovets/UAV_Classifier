@@ -83,8 +83,6 @@ class AugmentConfig:
     snr_min_db: float = 0.0
     snr_max_db: float = 20.0
 
-    ed_sample_weight: float = 4.0
-
 
 @dataclass(frozen=True)
 class DataLoaderConfig:
