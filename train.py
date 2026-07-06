@@ -19,7 +19,13 @@ from config import BEATS_CHECKPOINT, DEVICE, NUM_CLASSES, DataLoaderConfig, Trai
 from dataloader import make_dataloaders
 from dataset import CLASS_NAMES, ListenChannelDataset, prepare_train_split
 from model import ListenChannelBeatsClassifier
-from tracking import EpochMetrics, TrainingTracker, create_tracker, dataclass_params
+from tracking import (
+    DEFAULT_MLFLOW_TRACKING_URI,
+    EpochMetrics,
+    TrainingTracker,
+    create_tracker,
+    dataclass_params,
+)
 
 
 def _progress_mode() -> str:
@@ -491,7 +497,7 @@ def main() -> None:
     p_train.add_argument("--val-ratio", type=float, default=0.15)
     p_train.add_argument("--seed", type=int, default=0)
     p_train.add_argument("--mlflow", action="store_true", help="log metrics/plots to MLflow")
-    p_train.add_argument("--mlflow-uri", type=Path, default=Path("mlruns"))
+    p_train.add_argument("--mlflow-uri", default=DEFAULT_MLFLOW_TRACKING_URI)
     p_train.add_argument("--mlflow-experiment", default="uav-listen")
     p_train.add_argument("--mlflow-run-name", default=None)
     p_train.add_argument("--plot-path", type=Path, default=Path("training_curves.png"))

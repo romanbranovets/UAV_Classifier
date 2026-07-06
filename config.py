@@ -119,7 +119,7 @@ class TrainConfig:
     val_ratio: float = 0.15
     seed: int = 0
     mlflow_enabled: bool = False
-    mlflow_tracking_uri: str = "mlruns"
+    mlflow_tracking_uri: str = DEFAULT_MLFLOW_TRACKING_URI
     mlflow_experiment: str = "uav-listen"
     mlflow_run_name: Optional[str] = None
     plot_path: str = "training_curves.png"
