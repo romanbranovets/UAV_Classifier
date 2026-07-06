@@ -1,4 +1,4 @@
-"""Optional MLflow experiment tracking."""
+"""MLflow experiment tracking and matplotlib training curves."""
 
 from __future__ import annotations
 
@@ -63,8 +63,27 @@ class TrainingTracker:
     def log_checkpoint(self, path: Path) -> None:
         return None
 
-    def save_plots(self, path: Path) -> None:
-        return None
+
+def _epoch_row(
+    *,
+    step: int,
+    phase: str,
+    epoch: int,
+    train_loss: float,
+    val_loss: float,
+    lr: float,
+    metrics: EpochMetrics,
+) -> dict[str, float]:
+    return {
+        "step": float(step),
+        "epoch": float(epoch),
+        "train_loss": train_loss,
+        "val_loss": val_loss,
+        "lr": lr,
+        **metrics.as_log_dict(prefix="val"),
+        "phase_head": float(phase == "head"),
+        "phase_enc": float(phase == "enc"),
+    }
 
 
 class MlflowTracker(TrainingTracker):
@@ -74,11 +93,13 @@ class MlflowTracker(TrainingTracker):
         tracking_uri: str,
         experiment_name: str,
         run_name: Optional[str] = None,
+        plot_path: Path | str = "training_curves.png",
     ) -> None:
         super().__init__(enabled=True)
         import mlflow
 
         self._mlflow = mlflow
+        self._plot_path = Path(plot_path)
         mlflow.set_tracking_uri(tracking_uri)
         mlflow.set_experiment(experiment_name)
         self._run = mlflow.start_run(run_name=run_name)
@@ -105,16 +126,15 @@ class MlflowTracker(TrainingTracker):
         metrics: EpochMetrics,
     ) -> None:
         self._step += 1
-        row = {
-            "step": float(self._step),
-            "epoch": float(epoch),
-            "train_loss": train_loss,
-            "val_loss": val_loss,
-            "lr": lr,
-            **metrics.as_log_dict(prefix="val"),
-            "phase_head": float(phase == "head"),
-            "phase_enc": float(phase == "enc"),
-        }
+        row = _epoch_row(
+            step=self._step,
+            phase=phase,
+            epoch=epoch,
+            train_loss=train_loss,
+            val_loss=val_loss,
+            lr=lr,
+            metrics=metrics,
+        )
         self._history.append(row)
         self._mlflow.log_metrics(row, step=self._step)
         self._mlflow.set_tag("last_phase", phase)
@@ -123,17 +143,9 @@ class MlflowTracker(TrainingTracker):
         if path.is_file():
             self._mlflow.log_artifact(str(path), artifact_path="checkpoints")
 
-    def save_plots(self, path: Path) -> None:
-        if not self._history:
-            return
-        path.parent.mkdir(parents=True, exist_ok=True)
-        _save_training_plot(self._history, path)
-        self._mlflow.log_artifact(str(path), artifact_path="plots")
-
     def _write_plot(self) -> None:
-        plot_path = Path("training_curves.png")
-        _save_training_plot(self._history, plot_path)
-        self._mlflow.log_artifact(str(plot_path), artifact_path="plots")
+        save_training_plot(self._history, self._plot_path)
+        self._mlflow.log_artifact(str(self._plot_path), artifact_path="plots")
 
 
 def create_tracker(
@@ -142,6 +154,7 @@ def create_tracker(
     tracking_uri: str,
     experiment_name: str,
     run_name: Optional[str] = None,
+    plot_path: Path | str = "training_curves.png",
 ) -> TrainingTracker:
     if not enabled:
         return TrainingTracker(enabled=False)
@@ -149,16 +162,21 @@ def create_tracker(
         tracking_uri=tracking_uri,
         experiment_name=experiment_name,
         run_name=run_name,
+        plot_path=plot_path,
     )
 
 
-def _save_training_plot(history: list[dict[str, float]], path: Path) -> None:
+def save_training_plot(history: list[dict[str, float]], path: Path | str) -> Path:
+    """Draw loss / F1 curves with matplotlib and save to ``path``."""
     import matplotlib.pyplot as plt
+
+    path = Path(path)
+    if not history:
+        return path
 
     steps = [int(row["step"]) for row in history]
     train_loss = [row["train_loss"] for row in history]
     val_loss = [row["val_loss"] for row in history]
-    val_f1 = [row["val_macro_f1"] for row in history]
 
     fig, axes = plt.subplots(1, 2, figsize=(12, 4))
 
@@ -169,7 +187,7 @@ def _save_training_plot(history: list[dict[str, float]], path: Path) -> None:
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(steps, val_f1, label="val macro F1", color="tab:green")
+    axes[1].plot(steps, [row["val_macro_f1"] for row in history], label="macro F1", color="tab:green")
     for name in CLASS_NAMES:
         key = f"val_{name}_f1"
         if key in history[0]:
@@ -180,8 +198,10 @@ def _save_training_plot(history: list[dict[str, float]], path: Path) -> None:
     axes[1].grid(True, alpha=0.3)
 
     fig.tight_layout()
+    path.parent.mkdir(parents=True, exist_ok=True)
     fig.savefig(path, dpi=120)
     plt.close(fig)
+    return path
 
 
 def dataclass_params(obj: Any) -> dict[str, Any]:

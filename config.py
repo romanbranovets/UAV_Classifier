@@ -122,3 +122,4 @@ class TrainConfig:
     mlflow_tracking_uri: str = "mlruns"
     mlflow_experiment: str = "uav-listen"
     mlflow_run_name: Optional[str] = None
+    plot_path: str = "training_curves.png"

@@ -427,6 +427,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         mlflow_tracking_uri=str(args.mlflow_uri),
         mlflow_experiment=args.mlflow_experiment,
         mlflow_run_name=args.mlflow_run_name,
+        plot_path=str(args.plot_path),
     )
     loader_cfg = DataLoaderConfig(batch_size=args.batch_size, num_workers=args.num_workers)
 
@@ -443,6 +444,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         tracking_uri=train_cfg.mlflow_tracking_uri,
         experiment_name=train_cfg.mlflow_experiment,
         run_name=train_cfg.mlflow_run_name,
+        plot_path=train_cfg.plot_path,
     ) as tracker:
         tracker.log_params(
             {
@@ -492,6 +494,7 @@ def main() -> None:
     p_train.add_argument("--mlflow-uri", type=Path, default=Path("mlruns"))
     p_train.add_argument("--mlflow-experiment", default="uav-listen")
     p_train.add_argument("--mlflow-run-name", default=None)
+    p_train.add_argument("--plot-path", type=Path, default=Path("training_curves.png"))
     p_train.set_defaults(func=_cmd_train)
 
     args = parser.parse_args()
