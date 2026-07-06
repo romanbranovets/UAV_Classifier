@@ -16,6 +16,11 @@ NUM_CLASSES = 3
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
+# MLflow 3.x: use sqlite backend (filesystem ./mlruns is deprecated).
+DEFAULT_MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
+DEFAULT_MLFLOW_EXPERIMENT = "uav-listen"
+DEFAULT_PLOT_PATH = "training_curves.png"
+
 @dataclass(frozen=True)
 class PreprocessConfig:
     """Kaldi fbank preprocessing for BEATs (listen-channel recordings)."""
@@ -120,6 +125,6 @@ class TrainConfig:
     seed: int = 0
     mlflow_enabled: bool = False
     mlflow_tracking_uri: str = DEFAULT_MLFLOW_TRACKING_URI
-    mlflow_experiment: str = "uav-listen"
+    mlflow_experiment: str = DEFAULT_MLFLOW_EXPERIMENT
     mlflow_run_name: Optional[str] = None
-    plot_path: str = "training_curves.png"
+    plot_path: str = DEFAULT_PLOT_PATH

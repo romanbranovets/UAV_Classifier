@@ -2,14 +2,12 @@
 
 from __future__ import annotations
 
-import os
 from dataclasses import asdict, dataclass
 from pathlib import Path
 from typing import Any, Optional
 
+from config import DEFAULT_PLOT_PATH
 from dataset import CLASS_NAMES
-
-DEFAULT_MLFLOW_TRACKING_URI = "sqlite:///mlflow.db"
 
 
 @dataclass
@@ -89,20 +87,6 @@ def _epoch_row(
     }
 
 
-def resolve_mlflow_tracking_uri(tracking_uri: str | Path) -> str:
-    """
-    MLflow 3.x disables the filesystem backend (``./mlruns``) unless opted in.
-
-    ``sqlite://`` URIs are used as-is. Directory paths keep working via
-    ``MLFLOW_ALLOW_FILE_STORE=true``.
-    """
-    uri = str(tracking_uri)
-    if uri.startswith(("sqlite://", "http://", "https://", "postgresql://", "mysql://", "mssql://")):
-        return uri
-    os.environ.setdefault("MLFLOW_ALLOW_FILE_STORE", "true")
-    return uri
-
-
 class MlflowTracker(TrainingTracker):
     def __init__(
         self,
@@ -110,14 +94,14 @@ class MlflowTracker(TrainingTracker):
         tracking_uri: str,
         experiment_name: str,
         run_name: Optional[str] = None,
-        plot_path: Path | str = "training_curves.png",
+        plot_path: Path | str = DEFAULT_PLOT_PATH,
     ) -> None:
         super().__init__(enabled=True)
         import mlflow
 
         self._mlflow = mlflow
         self._plot_path = Path(plot_path)
-        mlflow.set_tracking_uri(resolve_mlflow_tracking_uri(tracking_uri))
+        mlflow.set_tracking_uri(tracking_uri)
         mlflow.set_experiment(experiment_name)
         self._run = mlflow.start_run(run_name=run_name)
         self._history: list[dict[str, float]] = []
@@ -171,7 +155,7 @@ def create_tracker(
     tracking_uri: str,
     experiment_name: str,
     run_name: Optional[str] = None,
-    plot_path: Path | str = "training_curves.png",
+    plot_path: Path | str = DEFAULT_PLOT_PATH,
 ) -> TrainingTracker:
     if not enabled:
         return TrainingTracker(enabled=False)

@@ -5,3 +5,6 @@ __pycache__/
 .ruff_cache/
 Dataset/
 checkpoints/
+mlflow.db
+mlruns/
+training_curves.png

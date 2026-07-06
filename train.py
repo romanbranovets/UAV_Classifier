@@ -15,17 +15,20 @@ from sklearn.metrics import accuracy_score, precision_recall_fscore_support
 from torch.utils.data import DataLoader
 from tqdm import tqdm
 
-from config import BEATS_CHECKPOINT, DEVICE, NUM_CLASSES, DataLoaderConfig, TrainConfig
+from config import (
+    BEATS_CHECKPOINT,
+    DEFAULT_MLFLOW_EXPERIMENT,
+    DEFAULT_MLFLOW_TRACKING_URI,
+    DEFAULT_PLOT_PATH,
+    DEVICE,
+    NUM_CLASSES,
+    DataLoaderConfig,
+    TrainConfig,
+)
 from dataloader import make_dataloaders
 from dataset import CLASS_NAMES, ListenChannelDataset, prepare_train_split
 from model import ListenChannelBeatsClassifier
-from tracking import (
-    DEFAULT_MLFLOW_TRACKING_URI,
-    EpochMetrics,
-    TrainingTracker,
-    create_tracker,
-    dataclass_params,
-)
+from tracking import EpochMetrics, TrainingTracker, create_tracker, dataclass_params
 
 
 def _progress_mode() -> str:
@@ -498,9 +501,9 @@ def main() -> None:
     p_train.add_argument("--seed", type=int, default=0)
     p_train.add_argument("--mlflow", action="store_true", help="log metrics/plots to MLflow")
     p_train.add_argument("--mlflow-uri", default=DEFAULT_MLFLOW_TRACKING_URI)
-    p_train.add_argument("--mlflow-experiment", default="uav-listen")
+    p_train.add_argument("--mlflow-experiment", default=DEFAULT_MLFLOW_EXPERIMENT)
     p_train.add_argument("--mlflow-run-name", default=None)
-    p_train.add_argument("--plot-path", type=Path, default=Path("training_curves.png"))
+    p_train.add_argument("--plot-path", type=Path, default=Path(DEFAULT_PLOT_PATH))
     p_train.set_defaults(func=_cmd_train)
 
     args = parser.parse_args()
