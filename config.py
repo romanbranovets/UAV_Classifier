@@ -86,7 +86,7 @@ class AugmentConfig:
 
 @dataclass(frozen=True)
 class DataLoaderConfig:
-    batch_size: int = 32
+    batch_size: int = 256
     num_workers: int = os.cpu_count()
     pin_memory: bool = True
     drop_last: bool = False
@@ -118,3 +118,7 @@ class TrainConfig:
     lr_scheduler_min_lr: float = 1e-7
     val_ratio: float = 0.15
     seed: int = 0
+    mlflow_enabled: bool = False
+    mlflow_tracking_uri: str = "mlruns"
+    mlflow_experiment: str = "uav-listen"
+    mlflow_run_name: Optional[str] = None

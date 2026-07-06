@@ -4,6 +4,8 @@ from __future__ import annotations
 
 import argparse
 import copy
+import os
+import sys
 from pathlib import Path
 
 import numpy as np
@@ -17,6 +19,48 @@ from config import BEATS_CHECKPOINT, DEVICE, NUM_CLASSES, DataLoaderConfig, Trai
 from dataloader import make_dataloaders
 from dataset import CLASS_NAMES, ListenChannelDataset, prepare_train_split
 from model import ListenChannelBeatsClassifier
+from tracking import EpochMetrics, TrainingTracker, create_tracker, dataclass_params
+
+
+def _progress_mode() -> str:
+    """``auto`` | ``full`` | ``epoch`` | ``off`` — set via ``TRAIN_PROGRESS`` env var."""
+    return os.environ.get("TRAIN_PROGRESS", "auto").lower()
+
+
+def _show_batch_progress() -> bool:
+    mode = _progress_mode()
+    if mode in ("off", "epoch"):
+        return False
+    if mode == "full":
+        return True
+    return sys.stderr.isatty()
+
+
+def _show_epoch_progress() -> bool:
+    mode = _progress_mode()
+    if mode == "off":
+        return False
+    if mode == "full":
+        return True
+    return sys.stderr.isatty()
+
+
+def _batch_progress(iterable, *, desc: str):
+    if not _show_batch_progress():
+        return iterable
+    return tqdm(
+        iterable,
+        desc=desc,
+        leave=False,
+        mininterval=1.0,
+        dynamic_ncols=True,
+    )
+
+
+def _epoch_progress(iterable, *, desc: str, unit: str = "epoch"):
+    if not _show_epoch_progress():
+        return iterable
+    return tqdm(iterable, desc=desc, unit=unit, leave=True, mininterval=1.0, dynamic_ncols=True)
 
 
 class EarlyStopping:
@@ -80,20 +124,40 @@ class BestCheckpointSaver:
         print(f"  saved best  val_loss={val_loss:.4f}  -> {self.path}")
         return True
 
-def _format_classification_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> str:
+def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> EpochMetrics:
     labels = list(range(NUM_CLASSES))
-    acc = accuracy_score(y_true, y_pred)
+    acc = float(accuracy_score(y_true, y_pred))
     macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=labels, average="macro", zero_division=0
     )
     prec, rec, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=labels, average=None, zero_division=0
     )
-    per_class = " ".join(
-        f"{name}:P={prec[i]:.2f}/R={rec[i]:.2f}/F1={f1[i]:.2f}"
-        for i, name in enumerate(CLASS_NAMES)
+    return EpochMetrics(
+        acc=acc,
+        macro_precision=float(macro_p),
+        macro_recall=float(macro_r),
+        macro_f1=float(macro_f1),
+        per_class_precision={name: float(prec[i]) for i, name in enumerate(CLASS_NAMES)},
+        per_class_recall={name: float(rec[i]) for i, name in enumerate(CLASS_NAMES)},
+        per_class_f1={name: float(f1[i]) for i, name in enumerate(CLASS_NAMES)},
     )
-    return f"acc={acc:.3f}  P={macro_p:.3f}  R={macro_r:.3f}  F1={macro_f1:.3f}  ({per_class})"
+
+
+def _format_metrics(metrics: EpochMetrics) -> str:
+    per_class = " ".join(
+        f"{name}:P={metrics.per_class_precision[name]:.2f}"
+        f"/R={metrics.per_class_recall[name]:.2f}"
+        f"/F1={metrics.per_class_f1[name]:.2f}"
+        for name in CLASS_NAMES
+    )
+    return (
+        f"acc={metrics.acc:.3f}  "
+        f"P={metrics.macro_precision:.3f}  "
+        f"R={metrics.macro_recall:.3f}  "
+        f"F1={metrics.macro_f1:.3f}  "
+        f"({per_class})"
+    )
 
 
 def _format_lrs(optimizer: torch.optim.Optimizer) -> str:
@@ -120,13 +184,13 @@ def _eval_epoch(
     criterion: nn.Module,
     *,
     desc: str = "val",
-) -> tuple[float, str]:
+) -> tuple[float, EpochMetrics]:
     model.eval()
     total_loss = 0.0
     total = 0
     labels_all: list[int] = []
     preds_all: list[int] = []
-    pbar = tqdm(loader, desc=desc, leave=False)
+    pbar = _batch_progress(loader, desc=desc)
     for batch in pbar:
         fbank = batch["fbank"].to(DEVICE)
         labels = batch["label"].to(DEVICE)
@@ -139,7 +203,8 @@ def _eval_epoch(
         pbar.set_postfix(loss=f"{total_loss / total:.4f}")
     y_true = np.asarray(labels_all, dtype=np.int64)
     y_pred = np.asarray(preds_all, dtype=np.int64)
-    return total_loss / max(total, 1), _format_classification_metrics(y_true, y_pred)
+    metrics = _compute_metrics(y_true, y_pred)
+    return total_loss / max(total, 1), metrics
 
 
 def _train_epoch(
@@ -156,7 +221,7 @@ def _train_epoch(
 
     total_loss = 0.0
     total = 0
-    pbar = tqdm(loader, desc=desc, leave=False)
+    pbar = _batch_progress(loader, desc=desc)
     for batch in pbar:
         fbank = batch["fbank"].to(DEVICE)
         labels = batch["label"].to(DEVICE)
@@ -185,8 +250,9 @@ def _run_phase(
     max_epochs: int,
     early_stopping: EarlyStopping,
     checkpoint_saver: BestCheckpointSaver | None = None,
+    tracker: TrainingTracker | None = None,
 ) -> None:
-    for epoch in tqdm(range(1, max_epochs + 1), desc=phase_name, unit="epoch"):
+    for epoch in _epoch_progress(range(1, max_epochs + 1), desc=phase_name, unit="epoch"):
         train_loss = _train_epoch(
             model,
             train_loader,
@@ -201,19 +267,31 @@ def _run_phase(
             desc=f"{phase_name} e{epoch:02d} val",
         )
         scheduler.step(val_loss)
+        lr = float(optimizer.param_groups[0]["lr"])
+        if tracker is not None and tracker.enabled:
+            tracker.log_epoch(
+                phase=phase_name,
+                epoch=epoch,
+                train_loss=train_loss,
+                val_loss=val_loss,
+                lr=lr,
+                metrics=val_metrics,
+            )
         if checkpoint_saver is not None:
-            checkpoint_saver.maybe_save(
+            saved = checkpoint_saver.maybe_save(
                 model,
                 val_loss,
                 phase=phase_name,
                 epoch=epoch,
-                metrics=val_metrics,
+                metrics=_format_metrics(val_metrics),
             )
+            if saved and tracker is not None and tracker.enabled and checkpoint_saver.path.is_file():
+                tracker.log_checkpoint(checkpoint_saver.path)
         stop = early_stopping.step(model, val_loss)
         print(
             f"  {phase_name} epoch {epoch:02d}  "
             f"train_loss={train_loss:.4f}  val_loss={val_loss:.4f}  "
-            f"lr={_format_lrs(optimizer)}  {val_metrics}"
+            f"lr={_format_lrs(optimizer)}  {_format_metrics(val_metrics)}"
             + ("  [stop]" if stop else "")
         )
         if stop:
@@ -226,7 +304,7 @@ def _run_phase(
         criterion,
         desc=f"{phase_name} best val",
     )
-    print(f"  {phase_name} best  val_loss={best_loss:.4f}  {best_metrics}")
+    print(f"  {phase_name} best  val_loss={best_loss:.4f}  {_format_metrics(best_metrics)}")
 
 
 def train_model(
@@ -236,12 +314,14 @@ def train_model(
     *,
     config: TrainConfig,
     output: Path | None = None,
+    tracker: TrainingTracker | None = None,
 ) -> ListenChannelBeatsClassifier:
     model = model.to(DEVICE)
     criterion = nn.CrossEntropyLoss()
     checkpoint_saver = (
         BestCheckpointSaver(output, min_delta=config.min_delta) if output is not None else None
     )
+    active_tracker = tracker or TrainingTracker(enabled=False)
 
     print(
         f"phase 1: head only, lr={config.head_lr}, "
@@ -264,6 +344,7 @@ def train_model(
         max_epochs=config.head_max_epochs,
         early_stopping=head_stop,
         checkpoint_saver=checkpoint_saver,
+        tracker=active_tracker,
     )
 
     print(
@@ -289,6 +370,7 @@ def train_model(
         max_epochs=config.encoder_max_epochs,
         early_stopping=encoder_stop,
         checkpoint_saver=checkpoint_saver,
+        tracker=active_tracker,
     )
 
     return model
@@ -341,6 +423,10 @@ def _cmd_train(args: argparse.Namespace) -> None:
         unfreeze_last_n_layers=args.unfreeze_layers,
         val_ratio=args.val_ratio,
         seed=args.seed,
+        mlflow_enabled=args.mlflow,
+        mlflow_tracking_uri=str(args.mlflow_uri),
+        mlflow_experiment=args.mlflow_experiment,
+        mlflow_run_name=args.mlflow_run_name,
     )
     loader_cfg = DataLoaderConfig(batch_size=args.batch_size, num_workers=args.num_workers)
 
@@ -352,7 +438,30 @@ def _cmd_train(args: argparse.Namespace) -> None:
     )
 
     model = ListenChannelBeatsClassifier.from_checkpoint(checkpoint)
-    train_model(model, train_loader, val_loader, config=train_cfg, output=args.output)
+    with create_tracker(
+        enabled=train_cfg.mlflow_enabled,
+        tracking_uri=train_cfg.mlflow_tracking_uri,
+        experiment_name=train_cfg.mlflow_experiment,
+        run_name=train_cfg.mlflow_run_name,
+    ) as tracker:
+        tracker.log_params(
+            {
+                **dataclass_params(train_cfg),
+                **dataclass_params(loader_cfg),
+                "dataset": str(args.dataset),
+                "beats_checkpoint": str(checkpoint),
+                "output": str(args.output),
+                "device": DEVICE,
+            }
+        )
+        train_model(
+            model,
+            train_loader,
+            val_loader,
+            config=train_cfg,
+            output=args.output,
+            tracker=tracker,
+        )
 
 
 def main() -> None:
@@ -379,6 +488,10 @@ def main() -> None:
     p_train.add_argument("--unfreeze-layers", type=int, default=2)
     p_train.add_argument("--val-ratio", type=float, default=0.15)
     p_train.add_argument("--seed", type=int, default=0)
+    p_train.add_argument("--mlflow", action="store_true", help="log metrics/plots to MLflow")
+    p_train.add_argument("--mlflow-uri", type=Path, default=Path("mlruns"))
+    p_train.add_argument("--mlflow-experiment", default="uav-listen")
+    p_train.add_argument("--mlflow-run-name", default=None)
     p_train.set_defaults(func=_cmd_train)
 
     args = parser.parse_args()
