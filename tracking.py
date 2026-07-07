@@ -13,9 +13,9 @@ from dataset import CLASS_NAMES
 @dataclass
 class EpochMetrics:
     acc: float
-    macro_precision: float
-    macro_recall: float
-    macro_f1: float
+    precision: float
+    recall: float
+    f1: float
     per_class_precision: dict[str, float]
     per_class_recall: dict[str, float]
     per_class_f1: dict[str, float]
@@ -23,9 +23,9 @@ class EpochMetrics:
     def as_log_dict(self, *, prefix: str = "val") -> dict[str, float]:
         out = {
             f"{prefix}_acc": self.acc,
-            f"{prefix}_macro_precision": self.macro_precision,
-            f"{prefix}_macro_recall": self.macro_recall,
-            f"{prefix}_macro_f1": self.macro_f1,
+            f"{prefix}_precision": self.precision,
+            f"{prefix}_recall": self.recall,
+            f"{prefix}_f1": self.f1,
         }
         for name in CLASS_NAMES:
             out[f"{prefix}_{name}_precision"] = self.per_class_precision[name]
@@ -188,10 +188,10 @@ def save_training_plot(history: list[dict[str, float]], path: Path | str) -> Pat
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(steps, [row["val_macro_f1"] for row in history], label="macro F1")
+    axes[1].plot(steps, [row["val_f1"] for row in history], label="uav F1")
     for name in CLASS_NAMES:
         key = f"val_{name}_f1"
-        if key in history[0]:
+        if key in history[0] and name != "uav":
             axes[1].plot(steps, [row[key] for row in history], label=f"{name} F1")
     axes[1].set_title("Validation F1")
     axes[1].set_xlabel("step")
