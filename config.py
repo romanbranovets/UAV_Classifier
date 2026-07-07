@@ -12,7 +12,7 @@ import torch
 # Microsoft OneDrive: https://github.com/microsoft/unilm/tree/master/beats
 BEATS_CHECKPOINT = "checkpoints/BEATs_iter3_plus_AS2M.pt"
 
-NUM_CLASSES = 3
+NUM_CLASSES = 2
 
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
@@ -79,10 +79,10 @@ class AugmentConfig:
     time_mask_count: int = 2
     time_mask_width: int = 32
 
-    ed_freq_mask_count: int = 3
-    ed_freq_mask_width: int = 30
-    ed_time_mask_count: int = 3
-    ed_time_mask_width: int = 40
+    uav_freq_mask_count: int = 3
+    uav_freq_mask_width: int = 30
+    uav_time_mask_count: int = 3
+    uav_time_mask_width: int = 40
 
     noise_mix_p: float = 0.3
     snr_min_db: float = 0.0
