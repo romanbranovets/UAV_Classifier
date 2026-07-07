@@ -28,14 +28,13 @@ def make_dataloaders(
     Train loader is shuffled; val loader is sequential.
     """
     cfg = loader_config or DataLoaderConfig()
-    use_cache = cache_clips and cfg.num_workers == 0
 
     dataset = ListenChannelDataset(
         root,
         config=preprocess_config,
         augment_config=augment_config,
         seed=seed,
-        cache_clips=use_cache,
+        cache_clips=cache_clips,
     )
     train_ds, val_ds = prepare_train_split(dataset, val_ratio=val_ratio, seed=seed)
 

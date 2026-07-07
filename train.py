@@ -516,7 +516,7 @@ def main() -> None:
         "--cache-clips",
         action="store_true",
         default=CONFIG.loader.cache_clips,
-        help="keep decoded WAV in RAM (only with --num-workers 0)",
+        help="keep decoded WAV in RAM (~9 GiB train; duplicates per DataLoader worker)",
     )
     p_train.add_argument("--head-max-epochs", type=int, default=CONFIG.head_max_epochs)
     p_train.add_argument("--encoder-max-epochs", type=int, default=CONFIG.encoder_max_epochs)
