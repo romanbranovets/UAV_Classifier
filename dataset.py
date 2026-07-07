@@ -25,15 +25,14 @@ SESSION_DIR_RE = re.compile(
 
 class Label(IntEnum):
     BKG = 0
-    DVS = 1
-    ED = 2
+    UAV = 1
 
 
-CLASS_NAMES = ("bkg", "dvs", "ed")
+CLASS_NAMES = ("bkg", "uav")
 LABEL_BY_NAME = {
     "Фон": Label.BKG,
-    "ДВС": Label.DVS,
-    "ЭД": Label.ED,
+    "ДВС": Label.UAV,
+    "ЭД": Label.UAV,
 }
 
 # Per-channel tabular features from ground_truth.json (same for all windows of a clip).
@@ -357,7 +356,7 @@ class ListenChannelDataset(Dataset):
 
         if index in self._augment_indices and self._train_background_indices:
             cfg = self.augment_config
-            if label in (Label.DVS, Label.ED) and self._rng.random() < cfg.noise_mix_p:
+            if label == Label.UAV and self._rng.random() < cfg.noise_mix_p:
                 bg_index = int(self._rng.choice(self._train_background_indices))
                 bg_chunk, _, _ = self._load_window_chunk(bg_index)
                 snr_db = self._rng.uniform(cfg.snr_min_db, cfg.snr_max_db)
@@ -392,7 +391,7 @@ def _select_val_session_keys(
     rng: np.random.Generator,
 ) -> list[str]:
     """
-    Pick val sessions without leakage: cover Фон/ДВС/ЭД, then fill to ``n_val``.
+    Pick val sessions without leakage: cover Фон/БПЛА, then fill to ``n_val``.
 
     Class coverage has priority over ``val_ratio`` when a single session cannot
     represent all labels.

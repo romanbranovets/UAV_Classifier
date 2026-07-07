@@ -118,7 +118,7 @@ def load_beats_encoder(
     Load a BEATs encoder from an official ``.pt`` checkpoint.
 
     Predictor weights from AudioSet fine-tuned checkpoints are dropped; attach
-    ``ListenChannelBeatsClassifier`` SupCon head for bkg/dvs/ed.
+    ``ListenChannelBeatsClassifier`` SupCon head for bkg/uav.
     """
     checkpoint = torch.load(checkpoint_path, map_location=map_location, weights_only=False)
     cfg = BEATsConfig(checkpoint["cfg"])

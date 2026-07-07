@@ -55,13 +55,13 @@ def apply_spec_augment(
     if rng.random() >= cfg.spec_augment_p:
         return log_mel
 
-    if label == 2:
+    if label == 1:
         return spec_augment(
             log_mel,
-            freq_mask_count=cfg.ed_freq_mask_count,
-            freq_mask_width=cfg.ed_freq_mask_width,
-            time_mask_count=cfg.ed_time_mask_count,
-            time_mask_width=cfg.ed_time_mask_width,
+            freq_mask_count=cfg.uav_freq_mask_count,
+            freq_mask_width=cfg.uav_freq_mask_width,
+            time_mask_count=cfg.uav_time_mask_count,
+            time_mask_width=cfg.uav_time_mask_width,
             rng=rng,
         )
 
