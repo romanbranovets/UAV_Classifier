@@ -26,7 +26,7 @@ from config import (
     TrainConfig,
 )
 from dataloader import make_dataloaders
-from dataset import CLASS_NAMES, ListenChannelDataset, prepare_train_split
+from dataset import CLASS_NAMES, Label, ListenChannelDataset, prepare_train_split
 from model import ListenChannelBeatsClassifier, SupConLoss
 from tracking import EpochMetrics, TrainingTracker, create_tracker, dataclass_params
 
@@ -145,17 +145,21 @@ class BestCheckpointSaver:
 def _compute_metrics(y_true: np.ndarray, y_pred: np.ndarray) -> EpochMetrics:
     labels = list(range(NUM_CLASSES))
     acc = float(accuracy_score(y_true, y_pred))
-    macro_p, macro_r, macro_f1, _ = precision_recall_fscore_support(
-        y_true, y_pred, labels=labels, average="macro", zero_division=0
-    )
     prec, rec, f1, _ = precision_recall_fscore_support(
         y_true, y_pred, labels=labels, average=None, zero_division=0
     )
+    pos_p, pos_r, pos_f1, _ = precision_recall_fscore_support(
+        y_true,
+        y_pred,
+        average="binary",
+        pos_label=int(Label.UAV),
+        zero_division=0,
+    )
     return EpochMetrics(
         acc=acc,
-        macro_precision=float(macro_p),
-        macro_recall=float(macro_r),
-        macro_f1=float(macro_f1),
+        precision=float(pos_p),
+        recall=float(pos_r),
+        f1=float(pos_f1),
         per_class_precision={name: float(prec[i]) for i, name in enumerate(CLASS_NAMES)},
         per_class_recall={name: float(rec[i]) for i, name in enumerate(CLASS_NAMES)},
         per_class_f1={name: float(f1[i]) for i, name in enumerate(CLASS_NAMES)},
@@ -166,14 +170,13 @@ def _format_metrics(metrics: EpochMetrics) -> str:
     per_class = " ".join(
         f"{name}:P={metrics.per_class_precision[name]:.2f}"
         f"/R={metrics.per_class_recall[name]:.2f}"
-        f"/F1={metrics.per_class_f1[name]:.2f}"
         for name in CLASS_NAMES
     )
     return (
         f"acc={metrics.acc:.3f}  "
-        f"P={metrics.macro_precision:.3f}  "
-        f"R={metrics.macro_recall:.3f}  "
-        f"F1={metrics.macro_f1:.3f}  "
+        f"P={metrics.precision:.3f}  "
+        f"R={metrics.recall:.3f}  "
+        f"F1={metrics.f1:.3f}  "
         f"({per_class})"
     )
 
