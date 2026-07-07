@@ -374,18 +374,6 @@ class ListenChannelDataset(Dataset):
         }
 
 
-def class_weights_from_indices(
-    dataset: ListenChannelDataset,
-    indices: Sequence[int],
-) -> torch.Tensor:
-    """Inverse-frequency class weights for ``CrossEntropyLoss`` (mean weight = 1)."""
-    idx = np.asarray(indices, dtype=np.intp)
-    labels = dataset._clip_labels[dataset._window_clip_index[idx]].astype(np.intp)
-    counts = np.bincount(labels, minlength=len(CLASS_NAMES)).astype(np.float64)
-    counts = np.maximum(counts, 1.0)
-    weights = counts.sum() / (len(CLASS_NAMES) * counts)
-    return torch.tensor(weights, dtype=torch.float32)
-
 
 _REQUIRED_VAL_LABELS = frozenset(Label)
 
