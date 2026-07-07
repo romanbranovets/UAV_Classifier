@@ -262,7 +262,7 @@ class ListenChannelDataset(Dataset):
         config: Optional[PreprocessConfig] = None,
         session_dirs: Optional[Sequence[Path | str]] = None,
         *,
-        cache_clips: bool = True,
+        cache_clips: bool = False,
         augment_config: Optional[AugmentConfig] = None,
         seed: int = 0,
     ) -> None:

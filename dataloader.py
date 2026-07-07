@@ -20,7 +20,7 @@ def make_dataloaders(
     loader_config: Optional[DataLoaderConfig] = None,
     val_ratio: float = 0.15,
     seed: int = 0,
-    cache_clips: bool = True,
+    cache_clips: bool = False,
 ) -> tuple[DataLoader, DataLoader, ListenChannelDataset, Subset, Subset]:
     """
     Build train/val DataLoaders with session split and train augmentations.
@@ -28,12 +28,14 @@ def make_dataloaders(
     Train loader is shuffled; val loader is sequential.
     """
     cfg = loader_config or DataLoaderConfig()
+    use_cache = cache_clips and cfg.num_workers == 0
+
     dataset = ListenChannelDataset(
         root,
         config=preprocess_config,
         augment_config=augment_config,
         seed=seed,
-        cache_clips=cache_clips,
+        cache_clips=use_cache,
     )
     train_ds, val_ds = prepare_train_split(dataset, val_ratio=val_ratio, seed=seed)
 

@@ -96,6 +96,7 @@ class DataLoaderConfig:
     pin_memory: bool = True
     drop_last: bool = False
     val_batch_size: Optional[int] = None
+    cache_clips: bool = False
 
 
 @dataclass(frozen=True)

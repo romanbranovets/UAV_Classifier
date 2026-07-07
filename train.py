@@ -455,6 +455,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         loader=DataLoaderConfig(
             batch_size=args.batch_size,
             num_workers=args.num_workers,
+            cache_clips=args.cache_clips,
         ),
     )
 
@@ -463,6 +464,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         loader_config=train_cfg.loader,
         val_ratio=train_cfg.val_ratio,
         seed=train_cfg.seed,
+        cache_clips=train_cfg.loader.cache_clips,
     )
     class_weights = class_weights_from_indices(dataset, train_ds.indices).to(DEVICE)
 
@@ -510,6 +512,12 @@ def main() -> None:
     p_train.add_argument("--output", type=Path, default=Path(CONFIG.output_checkpoint))
     p_train.add_argument("--batch-size", type=int, default=CONFIG.loader.batch_size)
     p_train.add_argument("--num-workers", type=int, default=CONFIG.loader.num_workers)
+    p_train.add_argument(
+        "--cache-clips",
+        action="store_true",
+        default=CONFIG.loader.cache_clips,
+        help="keep decoded WAV in RAM (only with --num-workers 0)",
+    )
     p_train.add_argument("--head-max-epochs", type=int, default=CONFIG.head_max_epochs)
     p_train.add_argument("--encoder-max-epochs", type=int, default=CONFIG.encoder_max_epochs)
     p_train.add_argument("--patience", type=int, default=CONFIG.patience)
