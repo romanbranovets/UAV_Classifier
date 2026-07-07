@@ -20,12 +20,14 @@ from config import (
     CONFIG,
     DEVICE,
     NUM_CLASSES,
+    BeatsClassifierConfig,
+    MODEL_CONFIG,
     DataLoaderConfig,
     TrainConfig,
 )
 from dataloader import make_dataloaders
-from dataset import CLASS_NAMES, ListenChannelDataset, class_weights_from_indices, prepare_train_split
-from model import ListenChannelBeatsClassifier
+from dataset import CLASS_NAMES, ListenChannelDataset, prepare_train_split
+from model import ListenChannelBeatsClassifier, SupConLoss
 from tracking import EpochMetrics, TrainingTracker, create_tracker, dataclass_params
 
 
@@ -193,11 +195,27 @@ def _make_lr_scheduler(
     )
 
 
+def _forward_loss(
+    model: nn.Module,
+    fbank: torch.Tensor,
+    labels: torch.Tensor,
+    criterion: SupConLoss,
+    *,
+    update_prototypes: bool,
+) -> torch.Tensor:
+    base = _unwrap(model)
+    out = model(fbank)
+    projection = out["projection"]
+    if update_prototypes:
+        base.prototypes.update(projection.detach(), labels)
+    return criterion(projection, labels)
+
+
 @torch.no_grad()
 def _eval_epoch(
     model: ListenChannelBeatsClassifier,
     loader: DataLoader,
-    criterion: nn.Module,
+    criterion: SupConLoss,
     *,
     desc: str = "val",
 ) -> tuple[float, EpochMetrics]:
@@ -210,9 +228,9 @@ def _eval_epoch(
     for batch in pbar:
         fbank = batch["fbank"].to(DEVICE)
         labels = batch["label"].to(DEVICE)
-        logits = model(fbank)["logits"]
-        total_loss += float(criterion(logits, labels).item()) * labels.size(0)
-        preds = logits.argmax(dim=1)
+        out = model(fbank)
+        total_loss += float(criterion(out["projection"], labels).item()) * labels.size(0)
+        preds = out["logits"].argmax(dim=1)
         labels_all.extend(labels.cpu().tolist())
         preds_all.extend(preds.cpu().tolist())
         total += labels.numel()
@@ -226,7 +244,7 @@ def _eval_epoch(
 def _train_epoch(
     model: ListenChannelBeatsClassifier,
     loader: DataLoader,
-    criterion: nn.Module,
+    criterion: SupConLoss,
     optimizer: torch.optim.Optimizer,
     *,
     desc: str = "train",
@@ -244,8 +262,7 @@ def _train_epoch(
         labels = batch["label"].to(DEVICE)
 
         optimizer.zero_grad(set_to_none=True)
-        logits = model(fbank)["logits"]
-        loss = criterion(logits, labels)
+        loss = _forward_loss(model, fbank, labels, criterion, update_prototypes=True)
         loss.backward()
         optimizer.step()
 
@@ -260,7 +277,7 @@ def _run_phase(
     train_loader: DataLoader,
     val_loader: DataLoader,
     *,
-    criterion: nn.Module,
+    criterion: SupConLoss,
     optimizer: torch.optim.Optimizer,
     scheduler: torch.optim.lr_scheduler.ReduceLROnPlateau,
     phase_name: str,
@@ -330,14 +347,19 @@ def train_model(
     val_loader: DataLoader,
     *,
     config: TrainConfig,
-    class_weights: torch.Tensor | None = None,
     output: Path | None = None,
     tracker: TrainingTracker | None = None,
 ) -> ListenChannelBeatsClassifier:
     model = model.to(DEVICE)
     if torch.cuda.device_count() > 1:
         model = nn.DataParallel(model)
-    criterion = nn.CrossEntropyLoss(weight=class_weights)
+    base = _unwrap(model)
+    criterion = SupConLoss(temperature=base.config.supcon_temperature)
+    print(
+        f"loss: supcon  proj_dim={base.config.proj_dim}  "
+        f"temperature={base.config.supcon_temperature}"
+    )
+
     checkpoint_saver = (
         BestCheckpointSaver(output, min_delta=config.min_delta) if output is not None else None
     )
@@ -459,16 +481,20 @@ def _cmd_train(args: argparse.Namespace) -> None:
         ),
     )
 
-    train_loader, val_loader, dataset, train_ds, _ = make_dataloaders(
+    train_loader, val_loader, _, _, _ = make_dataloaders(
         args.dataset,
         loader_config=train_cfg.loader,
         val_ratio=train_cfg.val_ratio,
         seed=train_cfg.seed,
         cache_clips=train_cfg.loader.cache_clips,
     )
-    class_weights = class_weights_from_indices(dataset, train_ds.indices).to(DEVICE)
 
-    model = ListenChannelBeatsClassifier.from_checkpoint(checkpoint)
+    model_cfg = BeatsClassifierConfig(
+        proj_dim=args.proj_dim,
+        supcon_temperature=args.supcon_temperature,
+        prototype_momentum=args.prototype_momentum,
+    )
+    model = ListenChannelBeatsClassifier.from_checkpoint(checkpoint, config=model_cfg)
     with create_tracker(
         enabled=train_cfg.mlflow_enabled,
         tracking_uri=train_cfg.mlflow_tracking_uri,
@@ -480,6 +506,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
             {
                 **dataclass_params(train_cfg),
                 **dataclass_params(train_cfg.loader),
+                **dataclass_params(model_cfg),
                 "dataset": str(args.dataset),
                 "beats_checkpoint": str(checkpoint),
                 "output": str(args.output),
@@ -491,7 +518,6 @@ def _cmd_train(args: argparse.Namespace) -> None:
             train_loader,
             val_loader,
             config=train_cfg,
-            class_weights=class_weights,
             output=args.output,
             tracker=tracker,
         )
@@ -523,6 +549,9 @@ def main() -> None:
     p_train.add_argument("--patience", type=int, default=CONFIG.patience)
     p_train.add_argument("--min-delta", type=float, default=CONFIG.min_delta)
     p_train.add_argument("--head-lr", type=float, default=CONFIG.head_lr)
+    p_train.add_argument("--proj-dim", type=int, default=MODEL_CONFIG.proj_dim)
+    p_train.add_argument("--supcon-temperature", type=float, default=MODEL_CONFIG.supcon_temperature)
+    p_train.add_argument("--prototype-momentum", type=float, default=MODEL_CONFIG.prototype_momentum)
     p_train.add_argument("--encoder-lr", type=float, default=CONFIG.encoder_lr)
     p_train.add_argument("--unfreeze-layers", type=int, default=CONFIG.unfreeze_last_n_layers)
     p_train.add_argument("--val-ratio", type=float, default=CONFIG.val_ratio)

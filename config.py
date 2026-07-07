@@ -101,11 +101,13 @@ class DataLoaderConfig:
 
 @dataclass(frozen=True)
 class BeatsClassifierConfig:
-    """MLP head on a frozen BEATs encoder (unfreeze top layers in training phase 2)."""
+    """SupCon projection head on a frozen BEATs encoder (unfreeze top layers in phase 2)."""
 
     num_classes: int = NUM_CLASSES
-    head_hidden_dim: int = 256
-    head_dropout: float = 0.5
+    proj_hidden_dim: int = 256
+    proj_dim: int = 128
+    supcon_temperature: float = 0.07
+    prototype_momentum: float = 0.9
     patch_size: int = 16
 
 
@@ -134,3 +136,4 @@ class TrainConfig:
 
 
 CONFIG = TrainConfig()
+MODEL_CONFIG = BeatsClassifierConfig()
