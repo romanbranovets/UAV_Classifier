@@ -17,18 +17,20 @@ from tqdm import tqdm
 
 from config import (
     BEATS_CHECKPOINT,
-    DEFAULT_MLFLOW_EXPERIMENT,
-    DEFAULT_MLFLOW_TRACKING_URI,
-    DEFAULT_PLOT_PATH,
+    CONFIG,
     DEVICE,
     NUM_CLASSES,
     DataLoaderConfig,
     TrainConfig,
 )
 from dataloader import make_dataloaders
-from dataset import CLASS_NAMES, ListenChannelDataset, prepare_train_split
+from dataset import CLASS_NAMES, ListenChannelDataset, class_weights_from_indices, prepare_train_split
 from model import ListenChannelBeatsClassifier
 from tracking import EpochMetrics, TrainingTracker, create_tracker, dataclass_params
+
+
+def _unwrap(model: nn.Module) -> ListenChannelBeatsClassifier:
+    return model.module if isinstance(model, nn.DataParallel) else model
 
 
 def _progress_mode() -> str:
@@ -90,7 +92,7 @@ class EarlyStopping:
     def step(self, model: nn.Module, val_loss: float) -> bool:
         if val_loss < self.best_loss - self.min_delta:
             self.best_loss = val_loss
-            self.best_state = copy.deepcopy(model.state_dict())
+            self.best_state = copy.deepcopy(_unwrap(model).state_dict())
             self.epochs_without_improvement = 0
             return False
 
@@ -99,7 +101,7 @@ class EarlyStopping:
 
     def restore_best(self, model: nn.Module) -> None:
         if self.best_state is not None:
-            model.load_state_dict(self.best_state)
+            _unwrap(model).load_state_dict(self.best_state)
 
 
 class BestCheckpointSaver:
@@ -126,7 +128,7 @@ class BestCheckpointSaver:
         self.path.parent.mkdir(parents=True, exist_ok=True)
         torch.save(
             {
-                "model": model.state_dict(),
+                "model": _unwrap(model).state_dict(),
                 "class_names": CLASS_NAMES,
                 "val_loss": val_loss,
                 "phase": phase,
@@ -230,8 +232,9 @@ def _train_epoch(
     desc: str = "train",
 ) -> float:
     model.train()
-    if not any(p.requires_grad for p in model.encoder.parameters()):
-        model.encoder.eval()
+    base = _unwrap(model)
+    if not any(p.requires_grad for p in base.encoder.parameters()):
+        base.encoder.eval()
 
     total_loss = 0.0
     total = 0
@@ -327,11 +330,14 @@ def train_model(
     val_loader: DataLoader,
     *,
     config: TrainConfig,
+    class_weights: torch.Tensor | None = None,
     output: Path | None = None,
     tracker: TrainingTracker | None = None,
 ) -> ListenChannelBeatsClassifier:
     model = model.to(DEVICE)
-    criterion = nn.CrossEntropyLoss()
+    if torch.cuda.device_count() > 1:
+        model = nn.DataParallel(model)
+    criterion = nn.CrossEntropyLoss(weight=class_weights)
     checkpoint_saver = (
         BestCheckpointSaver(output, min_delta=config.min_delta) if output is not None else None
     )
@@ -343,7 +349,7 @@ def train_model(
     )
     head_stop = EarlyStopping(patience=config.patience, min_delta=config.min_delta)
     optimizer = torch.optim.AdamW(
-        [model.head_parameter_group(lr=config.head_lr)],
+        [_unwrap(model).head_parameter_group(lr=config.head_lr)],
         weight_decay=config.weight_decay,
     )
     head_scheduler = _make_lr_scheduler(optimizer, config)
@@ -366,10 +372,13 @@ def train_model(
         f"head_lr={config.head_lr}, encoder_lr={config.encoder_lr}, "
         f"max_epochs={config.encoder_max_epochs}, patience={config.patience}"
     )
-    model.begin_encoder_finetune(last_n_layers=config.unfreeze_last_n_layers)
+    _unwrap(model).begin_encoder_finetune(last_n_layers=config.unfreeze_last_n_layers)
     encoder_stop = EarlyStopping(patience=config.patience, min_delta=config.min_delta)
     optimizer = torch.optim.AdamW(
-        model.parameter_groups(encoder_lr=config.encoder_lr, head_lr=config.head_lr),
+        _unwrap(model).parameter_groups(
+            encoder_lr=config.encoder_lr,
+            head_lr=config.head_lr,
+        ),
         weight_decay=config.weight_decay,
     )
     encoder_scheduler = _make_lr_scheduler(optimizer, config)
@@ -387,7 +396,7 @@ def train_model(
         tracker=active_tracker,
     )
 
-    return model
+    return _unwrap(model)
 
 
 def _cmd_inspect(args: argparse.Namespace) -> None:
@@ -407,7 +416,7 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
     print(f"window labels: {dict(sorted(window_labels.items()))}")
 
     if args.val_ratio > 0:
-        train_ds, val_ds, _sampler = prepare_train_split(dataset, val_ratio=args.val_ratio)
+        train_ds, val_ds = prepare_train_split(dataset, val_ratio=args.val_ratio)
         print(f"train windows: {len(train_ds)}  val windows: {len(val_ds)}")
         print(f"augment: on for {len(train_ds.indices)} train windows")
         print(f"background pool: {len(dataset._train_background_indices)} train windows")
@@ -442,15 +451,20 @@ def _cmd_train(args: argparse.Namespace) -> None:
         mlflow_experiment=args.mlflow_experiment,
         mlflow_run_name=args.mlflow_run_name,
         plot_path=str(args.plot_path),
+        output_checkpoint=str(args.output),
+        loader=DataLoaderConfig(
+            batch_size=args.batch_size,
+            num_workers=args.num_workers,
+        ),
     )
-    loader_cfg = DataLoaderConfig(batch_size=args.batch_size, num_workers=args.num_workers)
 
-    train_loader, val_loader, _, _, _ = make_dataloaders(
+    train_loader, val_loader, dataset, train_ds, _ = make_dataloaders(
         args.dataset,
-        loader_config=loader_cfg,
+        loader_config=train_cfg.loader,
         val_ratio=train_cfg.val_ratio,
         seed=train_cfg.seed,
     )
+    class_weights = class_weights_from_indices(dataset, train_ds.indices).to(DEVICE)
 
     model = ListenChannelBeatsClassifier.from_checkpoint(checkpoint)
     with create_tracker(
@@ -463,7 +477,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
         tracker.log_params(
             {
                 **dataclass_params(train_cfg),
-                **dataclass_params(loader_cfg),
+                **dataclass_params(train_cfg.loader),
                 "dataset": str(args.dataset),
                 "beats_checkpoint": str(checkpoint),
                 "output": str(args.output),
@@ -475,6 +489,7 @@ def _cmd_train(args: argparse.Namespace) -> None:
             train_loader,
             val_loader,
             config=train_cfg,
+            class_weights=class_weights,
             output=args.output,
             tracker=tracker,
         )
@@ -486,29 +501,34 @@ def main() -> None:
 
     p_inspect = sub.add_parser("inspect", help="summarize ListenChannelDataset")
     p_inspect.add_argument("dataset", type=Path, help="Dataset root (session folders)")
-    p_inspect.add_argument("--val-ratio", type=float, default=0.15)
+    p_inspect.add_argument("--val-ratio", type=float, default=CONFIG.val_ratio)
     p_inspect.set_defaults(func=_cmd_inspect)
 
     p_train = sub.add_parser("train", help="two-phase BEATs fine-tune (head → encoder)")
     p_train.add_argument("dataset", type=Path)
     p_train.add_argument("--checkpoint", type=Path, default=Path(BEATS_CHECKPOINT))
-    p_train.add_argument("--output", type=Path, default=Path("checkpoints/listen_classifier.pt"))
-    p_train.add_argument("--batch-size", type=int, default=32)
-    p_train.add_argument("--num-workers", type=int, default=2)
-    p_train.add_argument("--head-max-epochs", type=int, default=50)
-    p_train.add_argument("--encoder-max-epochs", type=int, default=50)
-    p_train.add_argument("--patience", type=int, default=5)
-    p_train.add_argument("--min-delta", type=float, default=1e-4)
-    p_train.add_argument("--head-lr", type=float, default=1e-3)
-    p_train.add_argument("--encoder-lr", type=float, default=1e-5)
-    p_train.add_argument("--unfreeze-layers", type=int, default=2)
-    p_train.add_argument("--val-ratio", type=float, default=0.15)
-    p_train.add_argument("--seed", type=int, default=0)
-    p_train.add_argument("--mlflow", action="store_true", help="log metrics/plots to MLflow")
-    p_train.add_argument("--mlflow-uri", default=DEFAULT_MLFLOW_TRACKING_URI)
-    p_train.add_argument("--mlflow-experiment", default=DEFAULT_MLFLOW_EXPERIMENT)
-    p_train.add_argument("--mlflow-run-name", default=None)
-    p_train.add_argument("--plot-path", type=Path, default=Path(DEFAULT_PLOT_PATH))
+    p_train.add_argument("--output", type=Path, default=Path(CONFIG.output_checkpoint))
+    p_train.add_argument("--batch-size", type=int, default=CONFIG.loader.batch_size)
+    p_train.add_argument("--num-workers", type=int, default=CONFIG.loader.num_workers)
+    p_train.add_argument("--head-max-epochs", type=int, default=CONFIG.head_max_epochs)
+    p_train.add_argument("--encoder-max-epochs", type=int, default=CONFIG.encoder_max_epochs)
+    p_train.add_argument("--patience", type=int, default=CONFIG.patience)
+    p_train.add_argument("--min-delta", type=float, default=CONFIG.min_delta)
+    p_train.add_argument("--head-lr", type=float, default=CONFIG.head_lr)
+    p_train.add_argument("--encoder-lr", type=float, default=CONFIG.encoder_lr)
+    p_train.add_argument("--unfreeze-layers", type=int, default=CONFIG.unfreeze_last_n_layers)
+    p_train.add_argument("--val-ratio", type=float, default=CONFIG.val_ratio)
+    p_train.add_argument("--seed", type=int, default=CONFIG.seed)
+    p_train.add_argument(
+        "--mlflow",
+        action="store_true",
+        default=CONFIG.mlflow_enabled,
+        help="log metrics/plots to MLflow",
+    )
+    p_train.add_argument("--mlflow-uri", default=CONFIG.mlflow_tracking_uri)
+    p_train.add_argument("--mlflow-experiment", default=CONFIG.mlflow_experiment)
+    p_train.add_argument("--mlflow-run-name", default=CONFIG.mlflow_run_name)
+    p_train.add_argument("--plot-path", type=Path, default=Path(CONFIG.plot_path))
     p_train.set_defaults(func=_cmd_train)
 
     args = parser.parse_args()

@@ -3,7 +3,7 @@
 from __future__ import annotations
 
 import os
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Optional
 
 import torch
@@ -104,7 +104,7 @@ class BeatsClassifierConfig:
 
     num_classes: int = NUM_CLASSES
     head_hidden_dim: int = 256
-    head_dropout: float = 0.3
+    head_dropout: float = 0.5
     patch_size: int = 16
 
 
@@ -112,9 +112,9 @@ class BeatsClassifierConfig:
 class TrainConfig:
     head_max_epochs: int = 50
     encoder_max_epochs: int = 50
-    patience: int = 10
+    patience: int = 5
     min_delta: float = 1e-4
-    head_lr: float = 1e-3
+    head_lr: float = 3e-4
     encoder_lr: float = 1e-5
     unfreeze_last_n_layers: int = 2
     weight_decay: float = 1e-3
@@ -128,3 +128,8 @@ class TrainConfig:
     mlflow_experiment: str = DEFAULT_MLFLOW_EXPERIMENT
     mlflow_run_name: Optional[str] = None
     plot_path: str = DEFAULT_PLOT_PATH
+    output_checkpoint: str = "checkpoints/listen_classifier.pt"
+    loader: DataLoaderConfig = field(default_factory=DataLoaderConfig)
+
+
+CONFIG = TrainConfig()

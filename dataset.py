@@ -12,7 +12,7 @@ from typing import Iterator, Optional, Sequence
 import numpy as np
 import soundfile as sf
 import torch
-from torch.utils.data import Dataset, Subset, WeightedRandomSampler
+from torch.utils.data import Dataset, Subset
 
 from augment import apply_spec_augment, mix_at_snr
 from config import AugmentConfig, PreprocessConfig
@@ -374,18 +374,17 @@ class ListenChannelDataset(Dataset):
         }
 
 
-def weighted_sampler(
+def class_weights_from_indices(
     dataset: ListenChannelDataset,
     indices: Sequence[int],
-) -> WeightedRandomSampler:
-    """Inverse-frequency weights — equal expected class share in train batches."""
+) -> torch.Tensor:
+    """Inverse-frequency class weights for ``CrossEntropyLoss`` (mean weight = 1)."""
     idx = np.asarray(indices, dtype=np.intp)
     labels = dataset._clip_labels[dataset._window_clip_index[idx]].astype(np.intp)
     counts = np.bincount(labels, minlength=len(CLASS_NAMES)).astype(np.float64)
     counts = np.maximum(counts, 1.0)
-    class_weights = counts[0] / counts
-    weights = class_weights[labels]
-    return WeightedRandomSampler(weights, num_samples=idx.size, replacement=True)
+    weights = counts.sum() / (len(CLASS_NAMES) * counts)
+    return torch.tensor(weights, dtype=torch.float32)
 
 
 _REQUIRED_VAL_LABELS = frozenset(Label)
@@ -470,9 +469,8 @@ def prepare_train_split(
     dataset: ListenChannelDataset,
     val_ratio: float = 0.15,
     seed: int = 42,
-) -> tuple[Subset, Subset, WeightedRandomSampler]:
-    """Session split + train augmentations + class-balanced sampler."""
+) -> tuple[Subset, Subset]:
+    """Session split + train augmentations."""
     train_ds, val_ds = split_dataset_by_session(dataset, val_ratio=val_ratio, seed=seed)
     dataset.set_augment_indices(train_ds.indices)
-    sampler = weighted_sampler(dataset, train_ds.indices)
-    return train_ds, val_ds, sampler
+    return train_ds, val_ds

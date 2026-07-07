@@ -23,9 +23,9 @@ def make_dataloaders(
     cache_clips: bool = True,
 ) -> tuple[DataLoader, DataLoader, ListenChannelDataset, Subset, Subset]:
     """
-    Build train/val DataLoaders with session split, augmentations, and class balancing.
+    Build train/val DataLoaders with session split and train augmentations.
 
-    Train loader uses ``WeightedRandomSampler`` (no shuffle). Val loader is sequential.
+    Train loader is shuffled; val loader is sequential.
     """
     cfg = loader_config or DataLoaderConfig()
     dataset = ListenChannelDataset(
@@ -35,12 +35,12 @@ def make_dataloaders(
         seed=seed,
         cache_clips=cache_clips,
     )
-    train_ds, val_ds, sampler = prepare_train_split(dataset, val_ratio=val_ratio, seed=seed)
+    train_ds, val_ds = prepare_train_split(dataset, val_ratio=val_ratio, seed=seed)
 
     train_loader = DataLoader(
         train_ds,
         batch_size=cfg.batch_size,
-        sampler=sampler,
+        shuffle=True,
         drop_last=cfg.drop_last,
         num_workers=cfg.num_workers,
         pin_memory=cfg.pin_memory and torch.cuda.is_available(),

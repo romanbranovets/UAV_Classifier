@@ -188,7 +188,7 @@ def save_training_plot(history: list[dict[str, float]], path: Path | str) -> Pat
     axes[0].legend()
     axes[0].grid(True, alpha=0.3)
 
-    axes[1].plot(steps, [row["val_macro_f1"] for row in history], label="macro F1", color="tab:green")
+    axes[1].plot(steps, [row["val_macro_f1"] for row in history], label="macro F1")
     for name in CLASS_NAMES:
         key = f"val_{name}_f1"
         if key in history[0]:
