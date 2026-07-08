@@ -12,6 +12,7 @@ dependencies = [
     "tqdm>=4.66",
     "matplotlib>=3.7",
     "mlflow>=2.10",
+    "datasets>=5.0.0",
 ]
 
 [tool.uv]

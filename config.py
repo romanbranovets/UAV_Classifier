@@ -14,6 +14,15 @@ BEATS_CHECKPOINT = "checkpoints/BEATs_iter3_plus_AS2M.pt"
 
 NUM_CLASSES = 2
 
+# Hugging Face DADS — stage-1 pretrain (16 kHz, bkg/uav).
+DADS_HF_DATASET = "geronimobasso/drone-audio-detection-samples"
+DADS_SOURCE_RATE = 16000
+DADS_VAL_RATIO = 0.1
+DADS_INDEX_CACHE_DIR = ".cache/dads"
+DADS_PRETRAIN_CHECKPOINT = "checkpoints/dads_pretrain.pt"
+DADS_HEAD_LR = 1e-4
+FINETUNE_HEAD_LR = 1e-5
+
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 
 # MLflow 3.x: use sqlite backend (filesystem ./mlruns is deprecated).

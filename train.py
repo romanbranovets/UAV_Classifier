@@ -6,6 +6,7 @@ import argparse
 import copy
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 
 import numpy as np
@@ -18,14 +19,20 @@ from tqdm import tqdm
 from config import (
     BEATS_CHECKPOINT,
     CONFIG,
+    DADS_HEAD_LR,
+    DADS_HF_DATASET,
+    DADS_INDEX_CACHE_DIR,
+    DADS_PRETRAIN_CHECKPOINT,
+    DADS_VAL_RATIO,
     DEVICE,
+    FINETUNE_HEAD_LR,
     NUM_CLASSES,
     BeatsClassifierConfig,
     MODEL_CONFIG,
     DataLoaderConfig,
     TrainConfig,
 )
-from dataloader import make_dataloaders
+from dataloader import make_dads_dataloaders, make_dataloaders
 from dataset import CLASS_NAMES, Label, ListenChannelDataset, prepare_train_split
 from model import ListenChannelBeatsClassifier, SupConLoss
 from tracking import EpochMetrics, TrainingTracker, create_tracker, dataclass_params
@@ -344,6 +351,18 @@ def _run_phase(
     print(f"  {phase_name} best  val_loss={best_loss:.4f}  {_format_metrics(best_metrics)}")
 
 
+def load_classifier_checkpoint(model: ListenChannelBeatsClassifier, path: Path) -> dict:
+    """Load classifier weights saved by ``BestCheckpointSaver``."""
+    if not path.is_file():
+        raise FileNotFoundError(f"classifier checkpoint not found: {path}")
+    payload = torch.load(path, map_location="cpu", weights_only=False)
+    state = payload.get("model")
+    if state is None:
+        raise ValueError(f"checkpoint missing 'model' state: {path}")
+    model.load_state_dict(state)
+    return payload
+
+
 def train_model(
     model: ListenChannelBeatsClassifier,
     train_loader: DataLoader,
@@ -352,6 +371,7 @@ def train_model(
     config: TrainConfig,
     output: Path | None = None,
     tracker: TrainingTracker | None = None,
+    encoder_finetune: bool = True,
 ) -> ListenChannelBeatsClassifier:
     model = model.to(DEVICE)
     if torch.cuda.device_count() > 1:
@@ -391,6 +411,9 @@ def train_model(
         checkpoint_saver=checkpoint_saver,
         tracker=active_tracker,
     )
+
+    if not encoder_finetune:
+        return _unwrap(model)
 
     print(
         f"phase 2: unfreeze last {config.unfreeze_last_n_layers} encoder layers, "
@@ -456,17 +479,34 @@ def _cmd_inspect(args: argparse.Namespace) -> None:
         )
 
 
-def _cmd_train(args: argparse.Namespace) -> None:
-    checkpoint = args.checkpoint
-    if not checkpoint.is_file():
-        raise FileNotFoundError(f"BEATs checkpoint not found: {checkpoint}")
+def _build_model(
+    checkpoint: Path,
+    *,
+    proj_dim: int,
+    supcon_temperature: float,
+    prototype_momentum: float,
+    init_checkpoint: Path | None = None,
+) -> ListenChannelBeatsClassifier:
+    model_cfg = BeatsClassifierConfig(
+        proj_dim=proj_dim,
+        supcon_temperature=supcon_temperature,
+        prototype_momentum=prototype_momentum,
+    )
+    model = ListenChannelBeatsClassifier.from_checkpoint(checkpoint, config=model_cfg)
+    if init_checkpoint is not None:
+        meta = load_classifier_checkpoint(model, init_checkpoint)
+        print(f"loaded init checkpoint: {init_checkpoint}  (phase={meta.get('phase')}, epoch={meta.get('epoch')})")
+    return model
 
-    train_cfg = TrainConfig(
+
+def _train_cfg_from_args(args: argparse.Namespace, *, default_head_lr: float) -> TrainConfig:
+    head_lr = args.head_lr if getattr(args, "head_lr", None) is not None else default_head_lr
+    return TrainConfig(
         head_max_epochs=args.head_max_epochs,
         encoder_max_epochs=args.encoder_max_epochs,
         patience=args.patience,
         min_delta=args.min_delta,
-        head_lr=args.head_lr,
+        head_lr=head_lr,
         encoder_lr=args.encoder_lr,
         unfreeze_last_n_layers=args.unfreeze_layers,
         val_ratio=args.val_ratio,
@@ -480,24 +520,73 @@ def _cmd_train(args: argparse.Namespace) -> None:
         loader=DataLoaderConfig(
             batch_size=args.batch_size,
             num_workers=args.num_workers,
-            cache_clips=args.cache_clips,
+            cache_clips=getattr(args, "cache_clips", False),
         ),
     )
 
-    train_loader, val_loader, _, _, _ = make_dataloaders(
-        args.dataset,
+
+def _add_train_hparams(parser: argparse.ArgumentParser) -> None:
+    parser.add_argument("--checkpoint", type=Path, default=Path(BEATS_CHECKPOINT), help="BEATs encoder .pt")
+    parser.add_argument("--output", type=Path, default=Path(CONFIG.output_checkpoint))
+    parser.add_argument("--batch-size", type=int, default=CONFIG.loader.batch_size)
+    parser.add_argument("--num-workers", type=int, default=CONFIG.loader.num_workers)
+    parser.add_argument("--head-max-epochs", type=int, default=CONFIG.head_max_epochs)
+    parser.add_argument("--encoder-max-epochs", type=int, default=CONFIG.encoder_max_epochs)
+    parser.add_argument("--patience", type=int, default=CONFIG.patience)
+    parser.add_argument("--min-delta", type=float, default=CONFIG.min_delta)
+    parser.add_argument("--head-lr", type=float, default=None)
+    parser.add_argument("--proj-dim", type=int, default=MODEL_CONFIG.proj_dim)
+    parser.add_argument("--supcon-temperature", type=float, default=MODEL_CONFIG.supcon_temperature)
+    parser.add_argument("--prototype-momentum", type=float, default=MODEL_CONFIG.prototype_momentum)
+    parser.add_argument("--encoder-lr", type=float, default=CONFIG.encoder_lr)
+    parser.add_argument("--unfreeze-layers", type=int, default=CONFIG.unfreeze_last_n_layers)
+    parser.add_argument("--val-ratio", type=float, default=CONFIG.val_ratio)
+    parser.add_argument("--seed", type=int, default=CONFIG.seed)
+    parser.add_argument("--mlflow", action="store_true", default=CONFIG.mlflow_enabled)
+    parser.add_argument("--mlflow-uri", default=CONFIG.mlflow_tracking_uri)
+    parser.add_argument("--mlflow-experiment", default=CONFIG.mlflow_experiment)
+    parser.add_argument("--mlflow-run-name", default=CONFIG.mlflow_run_name)
+    parser.add_argument("--plot-path", type=Path, default=Path(CONFIG.plot_path))
+
+
+def _encoder_finetune_enabled(args: argparse.Namespace, *, pretrain: bool = False) -> bool:
+    if pretrain:
+        return bool(getattr(args, "encoder_finetune", False))
+    return not bool(getattr(args, "head_only", False))
+
+
+def _cmd_pretrain(args: argparse.Namespace) -> None:
+    beats_ckpt = args.checkpoint
+    if not beats_ckpt.is_file():
+        raise FileNotFoundError(f"BEATs checkpoint not found: {beats_ckpt}")
+
+    train_cfg = replace(
+        _train_cfg_from_args(args, default_head_lr=DADS_HEAD_LR),
+        val_ratio=args.val_ratio,
+        output_checkpoint=str(args.output),
+    )
+
+    train_loader, val_loader, dataset, train_ds, val_ds = make_dads_dataloaders(
+        hf_id=args.dads_dataset,
+        cache_dir=args.hf_cache_dir,
+        index_cache_dir=args.index_cache_dir,
         loader_config=train_cfg.loader,
         val_ratio=train_cfg.val_ratio,
         seed=train_cfg.seed,
-        cache_clips=train_cfg.loader.cache_clips,
+        max_clips=args.max_clips,
+        balance_train=not args.no_balance,
+    )
+    print(
+        f"DADS clips={dataset.num_clips} windows={len(dataset)} "
+        f"train={len(train_ds)} val={len(val_ds)}"
     )
 
-    model_cfg = BeatsClassifierConfig(
+    model = _build_model(
+        beats_ckpt,
         proj_dim=args.proj_dim,
         supcon_temperature=args.supcon_temperature,
         prototype_momentum=args.prototype_momentum,
     )
-    model = ListenChannelBeatsClassifier.from_checkpoint(checkpoint, config=model_cfg)
     with create_tracker(
         enabled=train_cfg.mlflow_enabled,
         tracking_uri=train_cfg.mlflow_tracking_uri,
@@ -509,9 +598,68 @@ def _cmd_train(args: argparse.Namespace) -> None:
             {
                 **dataclass_params(train_cfg),
                 **dataclass_params(train_cfg.loader),
-                **dataclass_params(model_cfg),
+                "stage": "dads_pretrain",
+                "dads_dataset": args.dads_dataset,
+                "beats_checkpoint": str(beats_ckpt),
+                "output": str(args.output),
+                "device": DEVICE,
+                "max_clips": args.max_clips,
+            }
+        )
+        train_model(
+            model,
+            train_loader,
+            val_loader,
+            config=train_cfg,
+            output=args.output,
+            tracker=tracker,
+            encoder_finetune=_encoder_finetune_enabled(args, pretrain=True),
+        )
+
+
+def _cmd_finetune(args: argparse.Namespace) -> None:
+    beats_ckpt = args.checkpoint
+    if not beats_ckpt.is_file():
+        raise FileNotFoundError(f"BEATs checkpoint not found: {beats_ckpt}")
+    if args.init_checkpoint is None:
+        raise ValueError("finetune requires --init-checkpoint from DADS pretrain stage")
+
+    train_cfg = _train_cfg_from_args(args, default_head_lr=FINETUNE_HEAD_LR)
+
+    train_loader, val_loader, dataset, train_ds, val_ds = make_dataloaders(
+        args.dataset,
+        loader_config=train_cfg.loader,
+        val_ratio=train_cfg.val_ratio,
+        seed=train_cfg.seed,
+        cache_clips=train_cfg.loader.cache_clips,
+    )
+    print(
+        f"operational sessions={dataset.num_sessions} clips={dataset.num_clips} "
+        f"windows={len(dataset)} train={len(train_ds)} val={len(val_ds)}"
+    )
+
+    model = _build_model(
+        beats_ckpt,
+        proj_dim=args.proj_dim,
+        supcon_temperature=args.supcon_temperature,
+        prototype_momentum=args.prototype_momentum,
+        init_checkpoint=args.init_checkpoint,
+    )
+    with create_tracker(
+        enabled=train_cfg.mlflow_enabled,
+        tracking_uri=train_cfg.mlflow_tracking_uri,
+        experiment_name=train_cfg.mlflow_experiment,
+        run_name=train_cfg.mlflow_run_name,
+        plot_path=train_cfg.plot_path,
+    ) as tracker:
+        tracker.log_params(
+            {
+                **dataclass_params(train_cfg),
+                **dataclass_params(train_cfg.loader),
+                "stage": "operational_finetune",
                 "dataset": str(args.dataset),
-                "beats_checkpoint": str(checkpoint),
+                "beats_checkpoint": str(beats_ckpt),
+                "init_checkpoint": str(args.init_checkpoint),
                 "output": str(args.output),
                 "device": DEVICE,
             }
@@ -523,6 +671,60 @@ def _cmd_train(args: argparse.Namespace) -> None:
             config=train_cfg,
             output=args.output,
             tracker=tracker,
+            encoder_finetune=_encoder_finetune_enabled(args),
+        )
+
+
+def _cmd_train(args: argparse.Namespace) -> None:
+    """Single-stage training on operational data (no DADS pretrain)."""
+    beats_ckpt = args.checkpoint
+    if not beats_ckpt.is_file():
+        raise FileNotFoundError(f"BEATs checkpoint not found: {beats_ckpt}")
+
+    default_head_lr = CONFIG.head_lr
+    train_cfg = _train_cfg_from_args(args, default_head_lr=default_head_lr)
+
+    train_loader, val_loader, _, _, _ = make_dataloaders(
+        args.dataset,
+        loader_config=train_cfg.loader,
+        val_ratio=train_cfg.val_ratio,
+        seed=train_cfg.seed,
+        cache_clips=train_cfg.loader.cache_clips,
+    )
+
+    model = _build_model(
+        beats_ckpt,
+        proj_dim=args.proj_dim,
+        supcon_temperature=args.supcon_temperature,
+        prototype_momentum=args.prototype_momentum,
+        init_checkpoint=getattr(args, "init_checkpoint", None),
+    )
+    with create_tracker(
+        enabled=train_cfg.mlflow_enabled,
+        tracking_uri=train_cfg.mlflow_tracking_uri,
+        experiment_name=train_cfg.mlflow_experiment,
+        run_name=train_cfg.mlflow_run_name,
+        plot_path=train_cfg.plot_path,
+    ) as tracker:
+        tracker.log_params(
+            {
+                **dataclass_params(train_cfg),
+                **dataclass_params(train_cfg.loader),
+                "stage": "operational_train",
+                "dataset": str(args.dataset),
+                "beats_checkpoint": str(beats_ckpt),
+                "output": str(args.output),
+                "device": DEVICE,
+            }
+        )
+        train_model(
+            model,
+            train_loader,
+            val_loader,
+            config=train_cfg,
+            output=args.output,
+            tracker=tracker,
+            encoder_finetune=_encoder_finetune_enabled(args),
         )
 
 
@@ -535,41 +737,73 @@ def main() -> None:
     p_inspect.add_argument("--val-ratio", type=float, default=CONFIG.val_ratio)
     p_inspect.set_defaults(func=_cmd_inspect)
 
-    p_train = sub.add_parser("train", help="two-phase BEATs fine-tune (head → encoder)")
+    p_train = sub.add_parser("train", help="train on operational Dataset/ only")
     p_train.add_argument("dataset", type=Path)
-    p_train.add_argument("--checkpoint", type=Path, default=Path(BEATS_CHECKPOINT))
-    p_train.add_argument("--output", type=Path, default=Path(CONFIG.output_checkpoint))
-    p_train.add_argument("--batch-size", type=int, default=CONFIG.loader.batch_size)
-    p_train.add_argument("--num-workers", type=int, default=CONFIG.loader.num_workers)
+    _add_train_hparams(p_train)
     p_train.add_argument(
         "--cache-clips",
         action="store_true",
         default=CONFIG.loader.cache_clips,
         help="keep decoded WAV in RAM (~9 GiB train; duplicates per DataLoader worker)",
     )
-    p_train.add_argument("--head-max-epochs", type=int, default=CONFIG.head_max_epochs)
-    p_train.add_argument("--encoder-max-epochs", type=int, default=CONFIG.encoder_max_epochs)
-    p_train.add_argument("--patience", type=int, default=CONFIG.patience)
-    p_train.add_argument("--min-delta", type=float, default=CONFIG.min_delta)
-    p_train.add_argument("--head-lr", type=float, default=CONFIG.head_lr)
-    p_train.add_argument("--proj-dim", type=int, default=MODEL_CONFIG.proj_dim)
-    p_train.add_argument("--supcon-temperature", type=float, default=MODEL_CONFIG.supcon_temperature)
-    p_train.add_argument("--prototype-momentum", type=float, default=MODEL_CONFIG.prototype_momentum)
-    p_train.add_argument("--encoder-lr", type=float, default=CONFIG.encoder_lr)
-    p_train.add_argument("--unfreeze-layers", type=int, default=CONFIG.unfreeze_last_n_layers)
-    p_train.add_argument("--val-ratio", type=float, default=CONFIG.val_ratio)
-    p_train.add_argument("--seed", type=int, default=CONFIG.seed)
     p_train.add_argument(
-        "--mlflow",
-        action="store_true",
-        default=CONFIG.mlflow_enabled,
-        help="log metrics/plots to MLflow",
+        "--init-checkpoint",
+        type=Path,
+        default=None,
+        help="optional classifier checkpoint (e.g. after DADS pretrain)",
     )
-    p_train.add_argument("--mlflow-uri", default=CONFIG.mlflow_tracking_uri)
-    p_train.add_argument("--mlflow-experiment", default=CONFIG.mlflow_experiment)
-    p_train.add_argument("--mlflow-run-name", default=CONFIG.mlflow_run_name)
-    p_train.add_argument("--plot-path", type=Path, default=Path(CONFIG.plot_path))
-    p_train.set_defaults(func=_cmd_train)
+    p_train.add_argument(
+        "--head-only",
+        action="store_true",
+        help="skip encoder fine-tune (phase 2)",
+    )
+    p_train.set_defaults(func=_cmd_train, head_only=False)
+
+    p_pretrain = sub.add_parser("pretrain", help="stage 1: fine-tune on Hugging Face DADS")
+    _add_train_hparams(p_pretrain)
+    p_pretrain.set_defaults(
+        output=Path(DADS_PRETRAIN_CHECKPOINT),
+        val_ratio=DADS_VAL_RATIO,
+        func=_cmd_pretrain,
+    )
+    p_pretrain.add_argument("--dads-dataset", default=DADS_HF_DATASET)
+    p_pretrain.add_argument("--hf-cache-dir", type=Path, default=Path(".cache/huggingface"))
+    p_pretrain.add_argument("--index-cache-dir", type=Path, default=Path(DADS_INDEX_CACHE_DIR))
+    p_pretrain.add_argument("--max-clips", type=int, default=None, help="limit clips for debugging")
+    p_pretrain.add_argument(
+        "--no-balance",
+        action="store_true",
+        help="disable balanced sampling on DADS train windows",
+    )
+    p_pretrain.add_argument(
+        "--encoder-finetune",
+        action="store_true",
+        help="also run encoder fine-tune on DADS (default: head only)",
+    )
+
+    p_finetune = sub.add_parser("finetune", help="stage 2: fine-tune on operational Dataset/")
+    p_finetune.add_argument("dataset", type=Path)
+    _add_train_hparams(p_finetune)
+    p_finetune.set_defaults(
+        val_ratio=CONFIG.val_ratio,
+        func=_cmd_finetune,
+    )
+    p_finetune.add_argument(
+        "--init-checkpoint",
+        type=Path,
+        required=True,
+        help="classifier checkpoint from pretrain stage",
+    )
+    p_finetune.add_argument(
+        "--cache-clips",
+        action="store_true",
+        default=CONFIG.loader.cache_clips,
+    )
+    p_finetune.add_argument(
+        "--head-only",
+        action="store_true",
+        help="skip encoder fine-tune (phase 2)",
+    )
 
     args = parser.parse_args()
     args.func(args)
